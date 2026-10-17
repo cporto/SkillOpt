@@ -59,17 +59,22 @@ def _mk_task(d: SessionDigest, obj: Dict[str, Any], idx: int) -> TaskRecord | No
     import hashlib
     tid = "llm_" + hashlib.sha256((d.project + intent).encode()).hexdigest()[:12]
 
-    if clean_checks:
-        return TaskRecord(
-            id=tid, project=d.project, intent=intent,
-            reference_kind="rule", judge={"kind": "rule", "checks": clean_checks},
-            outcome="success" if satisfied else "fail",
-            tags=["mined:llm"], source_sessions=[d.session_id],
-        )
+    # Prefer rubric judges over rule judges. Rubrics are scored by an LLM
+    # judge that evaluates actual quality, not keyword matching. Rule judges
+    # with contains/regex checks are trivially gameable — the optimizer learns
+    # to insert the required keywords without actually improving.
+    # Only fall back to rule judges when no rubric is available.
     if rubric:
         return TaskRecord(
             id=tid, project=d.project, intent=intent,
             reference_kind="rubric", reference=rubric,
+            outcome="success" if satisfied else "fail",
+            tags=["mined:llm"], source_sessions=[d.session_id],
+        )
+    if clean_checks:
+        return TaskRecord(
+            id=tid, project=d.project, intent=intent,
+            reference_kind="rule", judge={"kind": "rule", "checks": clean_checks},
             outcome="success" if satisfied else "fail",
             tags=["mined:llm"], source_sessions=[d.session_id],
         )

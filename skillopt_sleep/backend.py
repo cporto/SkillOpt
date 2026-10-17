@@ -513,6 +513,7 @@ class CliBackend(Backend):
         # recovers most of these.
         ev = getattr(self, "evidence", None)
         arr = None
+        import logging
         for attempt in range(2):
             p = prompt if attempt == 0 else (
                 prompt + "\n\nIMPORTANT: your previous reply was not valid JSON. "
@@ -520,11 +521,23 @@ class CliBackend(Backend):
             )
             raw = self._call(p, max_tokens=1024)
             self._tokens += len(p) // 4 + len(raw) // 4
+            call_error = getattr(self, "last_call_error", "") or ""
             if ev is not None:
                 ev.log("reflect", "exchange", target=target, attempt=attempt + 1,
                        backend=self.name, model=self.model,
                        n_failures=len(failures), prompt=p, raw_reply=raw,
-                       error=getattr(self, "last_call_error", "") or "")
+                       error=call_error)
+                # Separate model_call event so silent empty replies are visible in evidence:
+                ev.log("reflect", "model_call", target=target, attempt=attempt + 1,
+                       backend=self.name, model=self.model,
+                       prompt_length=len(p), response_length=len(raw),
+                       call_error=call_error)
+            # Guard: empty raw response with a call error means the backend failed.
+            # Don't waste the second attempt retrying a failing endpoint.
+            if not raw and call_error:
+                logging.getLogger("skillopt_sleep").error(
+                    "reflect %s attempt %d: backend returned empty with error=%s",
+                    target, attempt + 1, call_error[:200])
             arr = _extract_json(raw, "array")
             if isinstance(arr, list) and arr:
                 break
@@ -1689,6 +1702,7 @@ class AzureOpenAIBackend(CliBackend):
                     kwargs["max_completion_tokens"] = 16384
                 if self._compat_mode() and self.chat_extra_body:
                     kwargs["extra_body"] = self.chat_extra_body
+                kwargs['timeout'] = self.timeout
                 resp = client.chat.completions.create(**kwargs)
                 text = (resp.choices[0].message.content or "").strip()
                 try:

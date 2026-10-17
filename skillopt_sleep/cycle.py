@@ -341,6 +341,80 @@ def run_sleep_cycle(
         f"edits={len(result.applied_edits)} rejected={len(result.rejected_edits)}",
     )
 
+    # ── early abort: reflect produced zero edits ──────────────────────────
+    # When the LLM doesn't respond (reflect_raw empty), the pipeline produces
+    # zero edits, baseline == candidate, and the gate rejects with "n_edits=0"
+    # — but running the full gate comparison is meaningless and wastes tokens.
+    # Abort immediately with a clear diagnostic instead.
+    reflect_raw = getattr(result, "reflect_raw", "") or ""
+    if not reflect_raw and not result.applied_edits:
+        abort_message = (
+            "Reflect produced zero edits — the optimizer returned an empty "
+            "response (reflect_raw is empty, applied_edits=[]). The pipeline "
+            "is aborting before gate/stage because there is nothing to gate."
+        )
+        _progress(cfg, f"cycle aborted: {abort_message}")
+        report.n_replayed = len(tasks)
+        report.baseline_score = result.baseline_score
+        report.candidate_score = result.candidate_score
+        report.accepted = False
+        report.gate_action = "aborted_no_edits"
+        report.no_edits_reason = abort_message
+        report.edits = []
+        report.rejected_edits = []
+        report.tokens_used = backend.tokens_used()
+        report.ended_at = _now_iso(clock)
+        report.notes.append(abort_message)
+        if not dry_run:
+            staging_dir = write_staging(
+                project,
+                report=report,
+                proposed_skill=None,
+                proposed_memory=None,
+                live_skill_path=live_skill_path,
+                live_memory_path=live_memory_path,
+                report_md=_render_report_md(report, cfg),
+                out_dir=staging_dir_pre,
+            )
+            try:
+                import json as _json
+                with open(os.path.join(staging_dir, "diagnostics.json"), "w", encoding="utf-8") as _fh:
+                    _json.dump({
+                        "night": night,
+                        "backend": cfg.get("backend"),
+                        "gate_mode": cfg.get("gate_mode"),
+                        "n_tasks": len(tasks),
+                        "baseline_score": result.baseline_score,
+                        "candidate_score": result.candidate_score,
+                        "accepted": False,
+                        "n_applied_edits": 0,
+                        "n_rejected_edits": 0,
+                        "call_error": redact_secrets(getattr(result, "call_error", "")),
+                        "reflect_raw_head": redact_secrets(reflect_raw[:1200]),
+                        "holdout_detail": redact_secrets(getattr(result, "holdout_detail", [])),
+                        "cycle_aborted_with_message": abort_message,
+                    }, _fh, indent=2)
+            except Exception:
+                pass
+            state.set_last_harvest(project, started)
+            state.record_night({
+                "night": night, "accepted": False,
+                "baseline": result.baseline_score, "candidate": result.candidate_score,
+                "n_tasks": len(tasks), "staging": staging_dir,
+            })
+            state.save()
+        else:
+            staging_dir = ""
+        if ev is not None:
+            ev.log("cycle", "end", night=night, outcome="aborted_no_edits",
+                   gate_action="aborted_no_edits", accepted=False,
+                   baseline_score=result.baseline_score,
+                   candidate_score=result.candidate_score,
+                   n_applied_edits=0, n_rejected_edits=0,
+                   tokens_used=report.tokens_used, adopted=False,
+                   abort_reason=abort_message)
+        return CycleOutcome(report, staging_dir, False, [])
+
     report.n_replayed = len(tasks)
     report.baseline_score = result.baseline_score
     report.candidate_score = result.candidate_score

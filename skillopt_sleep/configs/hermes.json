@@ -1,0 +1,21 @@
+{
+  "backend": "azure",
+  "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "transcript_source": "hermes",
+  "azure_endpoint": "https://api.deepinfra.com/v1/openai",
+  "max_tasks_per_night": 20,
+  "max_sessions_per_night": 200,
+  "hermes_min_messages": 50,
+  "projects": "all",
+  "lookback_hours": 168,
+  "evolve_skill": true,
+  "evolve_memory": false,
+  "progress": true,
+  "redact_secrets": true,
+  "gate_mode": "on",
+  "gate_metric": "hard",
+  "edit_budget": 4,
+  "auto_adopt": true,
+  "evidence_log": true,
+  "llm_mine": true
+}

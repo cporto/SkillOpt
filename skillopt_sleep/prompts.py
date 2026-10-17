@@ -97,6 +97,17 @@ _REFLECT = (
     "changes the required output format/language, tells the agent to ask "
     "the user a question, or otherwise violates that contract — such a "
     "rule scores ZERO because the evaluator cannot honor it.\n"
+    "FORBIDDEN RULE PATTERNS — you MUST NOT propose rules that:\n"
+    "  - Tell the agent NEVER to ask the user for clarification.\n"
+    "  - Tell the agent to fabricate, invent, or hallucinate data.\n"
+    "  - Tell the agent to produce output without searching or verifying first.\n"
+    "  - Tell the agent to act on assumptions without confirming with the user.\n"
+    "  - Use phrases like 'never ask', 'do not ask', 'act without asking',\n"
+    "    'fabricate plausible results', 'make up', or 'use internal knowledge'.\n"
+    "These patterns cause the agent to hallucinate, skip verification, and\n"
+    "ignore missing inputs — they fix local rubrics at the cost of overall\n"
+    "correctness. If the real failure is that the agent hedges too much,\n"
+    "propose a narrow, situational rule about WHEN to act vs ask instead.\n"
     'Return ONLY a JSON array: '
     '[{"op":"add|replace|delete","content":"<rule>","anchor":"<text to replace/delete, optional>","rationale":"<why>"}].\n\n'
     "# Current __TARGET__\n__CUR_DOC__\n"
