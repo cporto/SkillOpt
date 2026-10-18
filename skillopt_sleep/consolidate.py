@@ -8,20 +8,25 @@ validation gate, vendored self-contained in ``skillopt_sleep.gate``.
 """
 from __future__ import annotations
 
-import os
+import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from skillopt_sleep.backend import Backend
-from skillopt_sleep.memory import apply_edits
-from skillopt_sleep.replay import aggregate_scores, replay_batch
-from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
-
 
 # Self-contained validation gate (vendored from SkillOpt; zero dependency on the
 # research package, so this open-source tool stays decoupled from the paper code).
 from skillopt_sleep.gate import evaluate_gate, select_gate_score
+from skillopt_sleep.memory import apply_edits_detailed
+from skillopt_sleep.replay import aggregate_scores, replay_batch
+from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
+
 _HAVE_REPO_GATE = True
+
+
+def _finite_score(value: float) -> float | None:
+    """Return a JSON-safe score, preserving finite values only."""
+    return value if math.isfinite(value) else None
 
 
 @dataclass
@@ -37,23 +42,45 @@ class ConsolidationResult:
     holdout_baseline: float
     holdout_candidate: float
     # ── observability (so a 0.0->0.0 night is self-diagnosing, not a black box) ──
+    # Edits that changed nothing (anchor not found, or a duplicate add). They are
+    # neither applied nor gate-rejected, so without this list they would vanish
+    # from the report and the night would look like the optimizer produced less
+    # than it did.
+    unmatched_edits: List[EditRecord] = field(default_factory=list)
     holdout_detail: List[dict] = field(default_factory=list)  # per val task: hard/soft/resp/why
     reflect_raw: str = ""        # the optimizer's last raw reply (empty => reflect produced nothing)
     call_error: str = ""         # backend's last call error (timeout/auth/empty)
+    # True when the gate's val slice was not disjoint from the tasks reflect
+    # saw, so its comparison cannot detect overfitting. A night in this state
+    # stages edits but never certifies them.
+    holdout_leaked: bool = False
+    # Each gated candidate carries the task-level comparison that produced its
+    # decision. This includes rejected intermediate skill/memory trials and the
+    # fresh final replay, so aggregate changes never hide an individual task.
+    # Keep new optional fields last to preserve positional construction.
+    gate_trials: List[dict] = field(default_factory=list)
 
 
-def _split(tasks: List[TaskRecord]) -> Tuple[List[TaskRecord], List[TaskRecord]]:
-    """Return (train_tasks, val_tasks).
+def _split(tasks: List[TaskRecord]) -> Tuple[List[TaskRecord], List[TaskRecord], bool]:
+    """Return ``(train_tasks, val_tasks, holdout_leaked)``.
 
     train drives reflect; val gates updates. test is held out entirely from
     consolidation and is scored by the caller. Accepts legacy split names
     (replay->train, holdout->val) for robustness.
+
+    ``holdout_leaked`` is True when val is not disjoint from train — i.e. the
+    gate would score the very tasks the edits were derived from. A single mined
+    task that carries a train/val (or legacy) split always lands here; a lone
+    ``test`` task instead yields empty train/val and no gate, so it is not
+    flagged as leaked. Such a non-disjoint comparison cannot detect overfitting,
+    so the caller must not treat it as validation.
     """
     def _norm(s: str) -> str:
         return {"replay": "train", "holdout": "val"}.get(s, s)
 
     train = [t for t in tasks if _norm(t.split) == "train"]
     val = [t for t in tasks if _norm(t.split) == "val"]
+    leaked = False
     # Be robust if a split is empty: fall back so a night still does something,
     # but never silently use test as train or val. An all-test batch therefore
     # returns empty train/val (caller scores test separately; gate is a no-op).
@@ -61,9 +88,15 @@ def _split(tasks: List[TaskRecord]) -> Tuple[List[TaskRecord], List[TaskRecord]]
         # Prefer train as the gate reference; otherwise any non-test tasks.
         # Do not fall back to the full task list (that would leak held-out test).
         val = train or [t for t in tasks if _norm(t.split) != "test"]
+        leaked = bool(val)
     if not train:
         train = val
-    return train, val
+        leaked = leaked or bool(train)
+    if not leaked and train and val:
+        train_ids = {t.id for t in train}
+        if any(t.id in train_ids for t in val):
+            leaked = True
+    return train, val, leaked
 
 
 def _holdout_detail(pairs: List[Tuple[TaskRecord, ReplayResult]]) -> List[dict]:
@@ -85,6 +118,65 @@ def _holdout_detail(pairs: List[Tuple[TaskRecord, ReplayResult]]) -> List[dict]:
     return out
 
 
+def _task_deltas(
+    tasks: List[TaskRecord],
+    baseline_pairs: List[Tuple[TaskRecord, ReplayResult]],
+    candidate_pairs: List[Tuple[TaskRecord, ReplayResult]],
+    metric: str,
+    mixed_weight: float,
+) -> List[dict]:
+    """Compare candidate scores with the matching baseline validation tasks."""
+    baseline_by_id = {task.id: result for task, result in baseline_pairs}
+    candidate_by_id = {task.id: result for task, result in candidate_pairs}
+    out: List[dict] = []
+    for task in tasks:
+        baseline = baseline_by_id.get(task.id)
+        candidate = candidate_by_id.get(task.id)
+        baseline_score = (
+            select_gate_score(baseline.hard, baseline.soft, metric, mixed_weight)
+            if baseline is not None
+            else None
+        )
+        candidate_score = (
+            select_gate_score(candidate.hard, candidate.soft, metric, mixed_weight)
+            if candidate is not None
+            else None
+        )
+        if baseline_score is None or candidate_score is None:
+            out.append({
+                "task_id": task.id,
+                "tags": list(task.tags or []),
+                "baseline_score": baseline_score,
+                "candidate_score": candidate_score,
+                "status": "regressed",
+                "scores_are_finite": False,
+            })
+            continue
+        scores_are_finite = math.isfinite(baseline_score) and math.isfinite(
+            candidate_score
+        )
+        if not scores_are_finite:
+            # The aggregate gate already rejects NaN, but +inf could otherwise
+            # look like an improvement. Strict mode treats any malformed task
+            # comparison as a regression and therefore fails closed.
+            status = "regressed"
+        elif candidate_score > baseline_score:
+            status = "improved"
+        elif candidate_score < baseline_score:
+            status = "regressed"
+        else:
+            status = "unchanged"
+        out.append({
+            "task_id": task.id,
+            "tags": list(task.tags or []),
+            "baseline_score": _finite_score(baseline_score),
+            "candidate_score": _finite_score(candidate_score),
+            "status": status,
+            "scores_are_finite": scores_are_finite,
+        })
+    return out
+
+
 def consolidate(
     backend: Backend,
     tasks: List[TaskRecord],
@@ -94,6 +186,7 @@ def consolidate(
     edit_budget: int = 4,
     gate_metric: str = "mixed",
     gate_mixed_weight: float = 0.5,
+    gate_no_regression: bool = False,
     gate_mode: str = "on",       # "on" (hard/soft per gate_metric) | "off" (greedy)
     rollouts_k: int = 1,         # >1 => multi-rollout contrastive reflection
     evolve_skill: bool = True,
@@ -111,7 +204,7 @@ def consolidate(
     """
     from skillopt_sleep import evidence as evlog
     ev = evlog.get(backend)
-    train_tasks, val_tasks = _split(tasks)
+    train_tasks, val_tasks, holdout_leaked = _split(tasks)
     gate_off = str(gate_mode).strip().lower() in {"off", "none", "false", "greedy"}
     holdout_detail: List[dict] = []
 
@@ -122,6 +215,7 @@ def consolidate(
     # both wasted cost and contrary to the "no val set required" design.
     if gate_off:
         base_hard, base_soft = 0.0, 0.0
+        base_pairs: List[Tuple[TaskRecord, ReplayResult]] = []
     else:
         evlog.set_phase(backend, "baseline_val")
         base_pairs = replay_batch(backend, val_tasks, skill, memory)
@@ -143,19 +237,28 @@ def consolidate(
     cand_skill, cand_memory = skill, memory
     all_applied: List[EditRecord] = []
     all_rejected: List[EditRecord] = []
+    all_unmatched: List[EditRecord] = []
+    gate_trials: List[dict] = []
+    current_pairs = base_pairs
 
     def _edits_payload(edits: List[EditRecord]) -> List[dict]:
         return [{"op": e.op, "content": e.content, "anchor": e.anchor,
                  "rationale": e.rationale} for e in edits]
 
     def _gate_apply(doc: str, edits: List[EditRecord], which: str) -> str:
-        nonlocal cand_skill, cand_memory, base_score, all_applied, all_rejected
+        nonlocal cand_skill, cand_memory, base_score, current_pairs
+        nonlocal all_applied, all_rejected
         if ev is not None:
             ev.log("reflect", "edits_returned", target=which,
                    n_edits=len(edits), edits=_edits_payload(edits))
         if not edits:
             return doc
-        new_doc, applied = apply_edits(doc, edits)
+        new_doc, applied, unmatched = apply_edits_detailed(doc, edits)
+        if unmatched:
+            all_unmatched.extend(unmatched)
+            if ev is not None:
+                ev.log("reflect", "edits_unmatched", target=which,
+                       n_edits=len(unmatched), edits=_edits_payload(unmatched))
         if not applied:
             return doc
         # gate OFF: accept greedily with NO val scoring (the daily-use path)
@@ -172,14 +275,33 @@ def consolidate(
         pairs = replay_batch(backend, val_tasks, trial_skill, trial_memory)
         h, s = aggregate_scores(pairs)
         cand_score = select_gate_score(h, s, gate_metric, gate_mixed_weight)
-        improved = cand_score > base_score
+        task_deltas = _task_deltas(
+            val_tasks, current_pairs, pairs, gate_metric, gate_mixed_weight
+        )
+        blocked_by_regression = bool(
+            gate_no_regression
+            and any(row["status"] == "regressed" for row in task_deltas)
+        )
+        trial_base_score = base_score
+        improved = cand_score > base_score and not blocked_by_regression
+        gate_trials.append({
+            "target": which,
+            "baseline_score": _finite_score(trial_base_score),
+            "candidate_score": _finite_score(cand_score),
+            "accepted": improved,
+            "blocked_by_regression": blocked_by_regression,
+            "task_deltas": task_deltas,
+        })
         if ev is not None:
             ev.log("gate", "trial", target=which, mode="gated",
-                   baseline_score=base_score, cand_hard=h, cand_soft=s,
+                   baseline_score=trial_base_score, cand_hard=h, cand_soft=s,
                    cand_score=cand_score, accepted=improved,
+                   blocked_by_regression=blocked_by_regression,
+                   task_deltas=task_deltas,
                    n_edits=len(applied))
         if improved:
-            base_score = max(base_score, cand_score)
+            base_score = cand_score
+            current_pairs = pairs
             all_applied.extend(applied)
             return new_doc
         all_rejected.extend(applied)
@@ -189,12 +311,13 @@ def consolidate(
         if rollouts_k > 1:
             # multi-rollout contrastive reflection: run each train task K times
             # and distill a rule from the good-vs-bad contrast (the imagination signal).
-            from skillopt_sleep.rollout import multi_rollout, contrastive_reflect
             # Parallelize across tasks (each multi_rollout also parallelizes its K
             # attempts). This dream phase is the dominant cost; serial execution
             # times out on real backends. Cap total in-flight at the worker env.
             import os
             from concurrent.futures import ThreadPoolExecutor
+
+            from skillopt_sleep.rollout import contrastive_reflect, multi_rollout
             try:
                 _w = int(os.environ.get("SKILLOPT_SLEEP_WORKERS", "1"))
             except ValueError:
@@ -215,6 +338,8 @@ def consolidate(
             edits = contrastive_reflect(
                 backend, sets, cand_skill, cand_memory,
                 edit_budget=edit_budget, target="skill",
+                gate_metric=gate_metric,
+                gate_mixed_weight=gate_mixed_weight,
             )
             # fall back to single-shot reflect if contrast yielded nothing
             if not edits:
@@ -258,6 +383,13 @@ def consolidate(
         final_hard, final_soft = aggregate_scores(final_pairs)
         final_score = select_gate_score(final_hard, final_soft, gate_metric, gate_mixed_weight)
         base_gate_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)
+        final_task_deltas = _task_deltas(
+            val_tasks, base_pairs, final_pairs, gate_metric, gate_mixed_weight
+        )
+        final_blocked_by_regression = bool(
+            gate_no_regression
+            and any(row["status"] == "regressed" for row in final_task_deltas)
+        )
         if _HAVE_REPO_GATE:
             gate = evaluate_gate(
                 candidate_skill=cand_skill,
@@ -273,10 +405,50 @@ def consolidate(
                 mixed_weight=gate_mixed_weight,
             )
             action = gate.action
-            accepted = bool(all_applied) and final_score > base_gate_score
+            accepted = (
+                bool(all_applied)
+                and final_score > base_gate_score
+                and not final_blocked_by_regression
+            )
         else:
             action = "accept" if final_score > base_gate_score else "reject"
-            accepted = bool(all_applied) and final_score > base_gate_score
+            accepted = (
+                bool(all_applied)
+                and final_score > base_gate_score
+                and not final_blocked_by_regression
+            )
+        # The gate scores documents, not edit bookkeeping: when every proposed
+        # edit was dropped during the per-target trials, `all_applied` is empty
+        # and nothing changed, yet the score comparison can still yield an
+        # accept-flavoured action. Reporting that as "accept_new_best" while
+        # `accepted` is False makes the headline contradict the outcome.
+        if not accepted and action in {"accept", "accept_new_best"}:
+            action = "reject"
+        # The gate cannot certify an improvement it measured on the same tasks
+        # the edits were derived from -- that comparison cannot detect
+        # overfitting, which is exactly how a reward hack scores 1.0. Abstain
+        # rather than report a verdict the evidence does not support. Edits are
+        # still staged, so a human can review them.
+        if accepted and holdout_leaked:
+            action = "reject_unverified"
+            accepted = False
+        # A per-target trial can improve and tentatively apply an edit, while a
+        # later fresh final replay regresses. The returned documents already
+        # roll back in that case; keep the edit bookkeeping/report consistent
+        # by moving those tentative edits into the rejected set as well.
+        if not accepted and all_applied:
+            for edit in all_applied:
+                if edit not in all_rejected:
+                    all_rejected.append(edit)
+            all_applied = []
+        gate_trials.append({
+            "target": "final",
+            "baseline_score": _finite_score(base_gate_score),
+            "candidate_score": _finite_score(final_score),
+            "accepted": accepted,
+            "blocked_by_regression": final_blocked_by_regression,
+            "task_deltas": final_task_deltas,
+        })
 
     if ev is not None:
         w = max(0.0, min(1.0, float(gate_mixed_weight)))
@@ -296,8 +468,13 @@ def consolidate(
                baseline_hard=base_hard, baseline_soft=base_soft,
                candidate_hard=final_hard, candidate_soft=final_soft,
                metric=gate_metric, mixed_weight=gate_mixed_weight,
+               blocked_by_regression=(
+                   final_blocked_by_regression if not gate_off else False
+               ),
+               task_deltas=(final_task_deltas if not gate_off else []),
                formula=formula, n_applied=len(all_applied),
-               n_rejected=len(all_rejected), night=night)
+               n_rejected=len(all_rejected),
+               n_unmatched=len(all_unmatched), night=night)
 
     return ConsolidationResult(
         accepted=accepted,
@@ -308,9 +485,12 @@ def consolidate(
         new_memory=cand_memory if accepted else memory,
         applied_edits=all_applied,
         rejected_edits=all_rejected,
+        unmatched_edits=all_unmatched,
         holdout_baseline=base_hard,
         holdout_candidate=final_hard,
         holdout_detail=holdout_detail,
+        gate_trials=gate_trials,
         reflect_raw=getattr(backend, "last_reflect_raw", "") or "",
         call_error=getattr(backend, "last_call_error", "") or "",
+        holdout_leaked=holdout_leaked,
     )

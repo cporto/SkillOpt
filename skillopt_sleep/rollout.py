@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from skillopt_sleep.backend import Backend, _extract_json
+from skillopt_sleep.gate import select_gate_score
 from skillopt_sleep.replay import replay_one
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
 
@@ -97,40 +98,61 @@ def contrastive_reflect(
     *,
     edit_budget: int = 4,
     target: str = "skill",
+    gate_metric: str = "hard",
+    gate_mixed_weight: float = 0.5,
 ) -> List[EditRecord]:
     """Distill a rule from the contrast between good and bad attempts.
 
-    We pick tasks with the highest score *spread* (some attempts passed, some
-    failed) — those are the most informative — and show the optimizer a
-    high-scoring vs a low-scoring attempt of each, asking what general rule makes
-    the good behavior reliable.
+    We pick tasks with the highest score *spread* under the same objective the
+    validation gate uses. This matters for soft and mixed gates: attempts may
+    have identical binary outcomes but materially different partial-credit
+    scores. The default remains hard-score selection for direct callers that do
+    not provide gate settings.
     """
-    informative = [rs for rs in rollout_sets if rs.spread > 0 and rs.best and rs.worst]
-    informative.sort(key=lambda rs: rs.spread, reverse=True)
+    informative: List[Tuple[float, RolloutSet, ReplayResult, ReplayResult, float, float]] = []
+    for rs in rollout_sets:
+        if len(rs.attempts) < 2:
+            continue
+        scored = [
+            (select_gate_score(r.hard, r.soft, gate_metric, gate_mixed_weight), r)
+            for r in rs.attempts
+        ]
+        best_score, best = max(scored, key=lambda pair: pair[0])
+        worst_score, worst = min(scored, key=lambda pair: pair[0])
+        spread = best_score - worst_score
+        if spread > 0:
+            informative.append((spread, rs, best, worst, best_score, worst_score))
+    informative.sort(key=lambda item: item[0], reverse=True)
     informative = informative[:6]
     if not informative:
         return []
 
+    from skillopt_sleep.backend import _optimizer_feedback
+
     blocks = []
-    for rs in informative:
+    for _spread, rs, best, worst, best_score, worst_score in informative:
         blocks.append(
             f"## Task: {rs.task.intent[:160]}\n"
-            f"- GOOD attempt (score {rs.best.hard:.1f}): {rs.best.response[:200]}\n"
-            f"- BAD  attempt (score {rs.worst.hard:.1f}): {rs.worst.response[:200]}\n"
-            f"  (bad failed: {rs.worst.fail_reason[:100]})"
+            f"- GOOD attempt ({gate_metric} score {best_score:.3f}; "
+            f"hard {best.hard:.3f}, soft {best.soft:.3f}): {best.response[:200]}\n"
+            f"- BAD  attempt ({gate_metric} score {worst_score:.3f}; "
+            f"hard {worst.hard:.3f}, soft {worst.soft:.3f}): {worst.response[:200]}\n"
+            f"  (actionable feedback: {_optimizer_feedback(rs.task, worst)[:160]})"
         )
     # the output contract the proposed rules must not violate (same guardrail the
     # single-shot reflect uses — prevents harness-violating rules like "return VBA"
     # or "ask the user for the range" on SpreadsheetBench).
     from skillopt_sleep.backend import _task_guardrail
-    guard = _task_guardrail([(rs.task, rs.best) for rs in informative])
+    guard = _task_guardrail([(rs.task, best) for _, rs, best, _, _, _ in informative])
     prompt = (
         "You are SkillOpt's optimizer doing CONTRASTIVE reflection. For each task "
-        "below the agent was run multiple times; some attempts succeeded and some "
-        "failed. Identify what the GOOD attempts did that the BAD ones did not, "
+        "below the agent was run multiple times; some attempts scored better than "
+        "others under the gate objective. Identify what the GOOD attempts did that "
+        "the BAD ones did not, "
         f"and propose at most {edit_budget} SHORT, GENERAL, reusable rules for the "
-        f"{target} that would make the good behavior reliable every time. Quote "
-        "concrete thresholds/formats verbatim; do not paraphrase vaguely. "
+        f"{target} that would make the good behavior reliable every time. Be "
+        "concrete about public task requirements, but never quote, reconstruct, "
+        "or optimize for private verifier syntax such as regexes or check source. "
         "Every rule MUST obey the task output contract (if shown) — never propose "
         "a rule that changes the required output format/language or tells the agent "
         "to ask the user a question; such a rule scores ZERO.\n"

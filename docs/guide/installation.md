@@ -27,9 +27,10 @@ checkout for those files.
     These docs track the latest `main`. The current PyPI release is `0.2.0`.
     The generic research `openai_compatible` backend, SkillOpt-Sleep handoff,
     Sleep support for non-Azure OpenAI-compatible endpoints, the Sleep
-    `--preferences` flag, and Cursor source/backend/plugin support landed after
-    that release and require a source install from `main` until the next
-    release.
+    `--preferences` flag, Cursor source/backend/plugin support, and Pi
+    source/backend support, multi-skill fan-out, and reviewed subset adoption
+    landed after that release and require a source install from `main` until
+    the next release.
 
 ### Source checkout
 
@@ -62,6 +63,19 @@ Install extras for specific benchmarks or backends:
     `claude_chat` backend launches `claude -p`, so install and authenticate the
     Claude Code CLI separately. The SDK extra is only needed when selecting an
     SDK-backed Claude Code exec path.
+
+=== "Pi coding-agent CLI (optional)"
+
+    ```bash
+    npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+    ```
+
+    Install and authenticate the [Pi coding-agent CLI](https://github.com/earendil-works/pi)
+    only when using SkillOpt-Sleep with `--backend pi`. Harvesting local Pi
+    transcripts with `--source pi` does not require the CLI or provider
+    authentication. By default, the source reads below
+    `~/.pi/agent/sessions`; `--pi-home` selects the parent directory that
+    contains `agent/sessions`.
 
 === "Qwen (Local)"
 

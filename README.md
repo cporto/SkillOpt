@@ -5,7 +5,7 @@
 [![Project Page](https://img.shields.io/badge/Project%20Page-SkillOpt-8dbb3c)](https://microsoft.github.io/SkillOpt/) [![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)](https://arxiv.org/abs/2605.23904) [![Project Video](https://img.shields.io/badge/Project%20Video-Watch%20Demo-ff0000)](https://youtu.be/JUBMDTCiM0M) [![PyPI](https://img.shields.io/badge/PyPI-skillopt-green.svg)](https://pypi.org/project/skillopt/) [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/38498?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-38498" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/38498/daily?language=Python" alt="microsoft%2FSkillOpt | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/38498?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-38498" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/38498" alt="microsoft%2FSkillOpt | Trendshift" width="250" height="55"/></a>
   <a href="https://trendshift.io/repositories/38498?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-38498" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/38498/weekly?language=Python" alt="microsoft%2FSkillOpt | Trendshift" width="250" height="55"/></a>
 </p>
 
@@ -65,8 +65,8 @@ https://github.com/user-attachments/assets/eb12d3bc-371c-467f-904d-91b61f339ed7
 ### Adding a new backend
 
 A backend = a chat / exec target (e.g. `openai_chat`, `claude_chat`,
-`qwen_chat`, `minimax_chat`, `openai_compatible`, `codex_exec`,
-`claude_code_exec`, `cursor_exec`). If a provider implements the OpenAI Chat Completions
+`qwen_chat`, `minimax_chat`, `copilot_chat`, `openai_compatible`, `codex_exec`,
+`claude_code_exec`, `cursor_exec`, `copilot_exec`). If a provider implements the OpenAI Chat Completions
 protocol, try the built-in `openai_compatible` backend before adding code. See
 [`docs/guide/new-backend.md`](docs/guide/new-backend.md) for the full
 contract. Chat backends add a `skillopt/model/<name>_backend.py` module;
@@ -94,11 +94,10 @@ python -m skillopt_webui.app
 | Flag | Default | Description |
 |---|---|---|
 | `--port` | 7860 | Server port |
-| `--host` | `0.0.0.0` | Bind address |
+| `--host` | `127.0.0.1` | Bind address |
 | `--share` | off | Create a public Gradio share link |
 
-The default host listens on every network interface. Use
-`--host 127.0.0.1` for local-only access.
+The default host is loopback-only; pass `--host 0.0.0.0` to expose the dashboard.
 
 ---
 

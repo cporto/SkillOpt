@@ -12,13 +12,16 @@ Resolution order (later wins):
 from __future__ import annotations
 
 import json
+import locale
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 HOME_STATE_DIR = os.path.expanduser("~/.skillopt-sleep")
 CLAUDE_HOME = os.path.expanduser("~/.claude")
 CODEX_HOME = os.path.expanduser("~/.codex")
+PI_HOME = os.path.expanduser("~/.pi")
 CURSOR_HOME = os.path.expanduser("~/.cursor")
 
 
@@ -26,8 +29,14 @@ DEFAULTS: Dict[str, Any] = {
     # ── scope ──────────────────────────────────────────────────────────────
     "claude_home": CLAUDE_HOME,
     "codex_home": CODEX_HOME,
+    "pi_home": PI_HOME,
     "cursor_home": CURSOR_HOME,
-    "transcript_source": "claude",  # "claude" | "codex" | "cursor" | "auto"
+    "vscode_workspace_storage": "",  # "" => auto-detect platform defaults
+    "copilot_cli_session_store": "",  # "" => ~/.copilot/session-store.db
+    "opencode_db": "",  # "" => OPENCODE_DB or the OpenCode XDG data path
+    # Explicit sources also include copilot, copilot_cli, cursor, pi, and opencode.
+    # ``auto`` keeps the established Codex-then-Claude precedence.
+    "transcript_source": "claude",
     "projects": "invoked",        # "invoked" | "all" | [list of abs paths]
     "invoked_project": "",        # filled at runtime (cwd) when projects == "invoked"
     "lookback_hours": 72,         # harvest window when no prior sleep recorded
@@ -38,7 +47,7 @@ DEFAULTS: Dict[str, Any] = {
     "val_fraction": 0.34,         # real tasks reserved to gate updates
     "test_fraction": 0.0,         # real tasks reserved as the final held-out measure
     # ── optimizer ──────────────────────────────────────────────────────────
-    "backend": "mock",            # "mock" | "claude" | "codex" | "copilot" | "cursor"
+    "backend": "mock",            # "mock" | "claude" | "codex" | "copilot" | "cursor" | "pi" | "opencode"
     "model": "",                  # backend-specific; "" => backend default
     # Dual-backend split (both empty => single backend above plays all roles).
     # target = the model whose skill is deployed (runs `attempt` rollouts);
@@ -50,11 +59,15 @@ DEFAULTS: Dict[str, Any] = {
     "azure_endpoint": "",         # explicit endpoint for azure/compat backends
     "gate_mode": "on",            # "on" (validation-gated) | "off" (greedy, no hard filter)
     "codex_path": "",             # "" => auto-detect the real @openai/codex binary
+    "pi_path": "",                # "" => use `pi` on PATH
     "cursor_path": "",            # "" => auto-detect the Cursor Agent CLI
+    "opencode_path": "",          # "" => SKILLOPT_SLEEP_OPENCODE_PATH, then `opencode` on PATH/PATHEXT
+    "opencode_tool_replay": False,  # explicit opt-in for OpenCode tool-aware replay
     "edit_budget": 4,             # textual learning rate (max edits/night)
     "preferences": "",            # free-text house rules injected into reflect as a prior
     "gate_metric": "mixed",       # hard | soft | mixed (mixed best for tiny holdouts)
     "gate_mixed_weight": 0.5,
+    "gate_no_regression": False,    # reject any candidate that lowers a val-task score
     "replay_mode": "mock",        # report label; fresh-worktree replay is not implemented
     # ── dream + recall (opt-in; defaults reproduce the prior single-shot loop) ─
     "dream_rollouts": 1,          # >1 => multi-rollout contrastive reflection per task
@@ -64,11 +77,16 @@ DEFAULTS: Dict[str, Any] = {
     "evolve_skill": True,         # consolidate the managed SKILL.md
     "llm_mine": True,             # use the backend to mine checkable tasks (real backends)
     "target_skill_path": "",      # explicit SKILL.md target for repo-scoped agents
+    "skill_roots": [],            # extra explicit roots containing <name>/SKILL.md
     "target_task_filter": True,   # prefer mined tasks matching target_skill_path/text
     "progress": False,            # print phase progress to stderr
     # ── observability ──────────────────────────────────────────────────────
     "evidence_log": True,         # write per-night evidence.jsonl (full evidentiary chain)
     "evidence_max_chars": 4000,   # per-field truncation cap for evidence events
+    # ``multi_skill_report`` is the compatibility alias used before fan-out
+    # began staging independently adoptable proposals.
+    "multi_skill_fanout": None,
+    "multi_skill_report": False,
     # ── adoption / safety ──────────────────────────────────────────────────
     "auto_adopt": False,          # default: stage + require explicit `adopt`
     "managed_skill_name": "skillopt-sleep-learned",
@@ -123,9 +141,37 @@ class SleepConfig:
         return os.path.join(self.data["codex_home"], "archived_sessions")
 
     @property
+    def pi_sessions_dir(self) -> str:
+        pi_home = os.path.abspath(os.path.expanduser(str(self.data["pi_home"])))
+        return os.path.join(pi_home, "agent", "sessions")
+
+    @property
     def cursor_projects_dir(self) -> str:
         cursor_home = os.path.abspath(os.path.expanduser(str(self.data["cursor_home"])))
         return os.path.join(cursor_home, "projects")
+
+    @property
+    def copilot_cli_session_store(self) -> str:
+        value = self.data.get("copilot_cli_session_store", "") or ""
+        if not value:
+            return ""
+        return os.path.abspath(os.path.expanduser(str(value)))
+
+    @property
+    def opencode_db_path(self) -> str:
+        value = self.data.get("opencode_db", "") or ""
+        if not value:
+            return ""
+        if str(value) == ":memory:":
+            return ":memory:"
+        return os.path.abspath(os.path.expanduser(str(value)))
+
+    @property
+    def vscode_workspace_storage(self) -> str:
+        value = self.data.get("vscode_workspace_storage", "") or ""
+        if not value:
+            return ""
+        return os.path.abspath(os.path.expanduser(str(value)))
 
     @property
     def history_path(self) -> str:
@@ -156,27 +202,56 @@ def _user_config_path() -> Optional[str]:
     return None
 
 
+class ConfigError(ValueError):
+    """An existing configuration could not be loaded safely."""
+
+
 def _load_file(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        # Older versions read using the process locale. Preserve that
+        # upgrade path without guessing unrelated encodings on a new machine.
+        encoding = locale.getencoding() if hasattr(locale, "getencoding") else locale.getpreferredencoding(False)
+        with open(path, encoding=encoding) as f:
+            text = f.read()
+        warnings.warn(
+            f"Sleep configuration {path!r} was read using the legacy {encoding} encoding; save it as UTF-8.",
+            UserWarning,
+            stacklevel=2,
+        )
     if path.endswith((".yaml", ".yml")):
-        try:
-            import yaml  # optional
-            with open(path) as f:
-                return yaml.safe_load(f) or {}
-        except Exception:
-            return {}
-    with open(path) as f:
-        return json.load(f)
+        import yaml  # optional
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("configuration must be a mapping")
+    return data
 
 
 def load_config(**overrides: Any) -> SleepConfig:
     data = dict(DEFAULTS)
+    user_keys: set[str] = set()
     path = _user_config_path()
     if path:
         try:
-            data.update(_load_file(path) or {})
-        except Exception:
-            pass
-    data.update({k: v for k, v in overrides.items() if v is not None})
+            file_data = _load_file(path)
+            user_keys.update(file_data.keys())
+            data.update(file_data)
+        except Exception as exc:
+            raise ConfigError(
+                f"Cannot load sleep configuration {path!r}. Check its format and permissions, "
+                "and save it as UTF-8 (or restore the original system locale). YAML requires PyYAML."
+            ) from exc
+    for key, value in overrides.items():
+        if value is not None:
+            data[key] = value
+            user_keys.add(key)
     if data.get("projects") == "invoked" and not data.get("invoked_project"):
         data["invoked_project"] = os.getcwd()
+    data["_user_config_keys"] = sorted(user_keys)
     return SleepConfig(data=data)

@@ -33,7 +33,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from skillopt_sleep.staging import redact_secrets
+from skillopt_sleep.staging import json_safe, redact_secrets
 
 
 def _now_iso() -> str:
@@ -72,12 +72,17 @@ class EvidenceLog:
     # ── the one write path ────────────────────────────────────────────────
     def log(self, stage: str, event: str, **data: Any) -> None:
         record = {"ts": _now_iso(), "stage": stage, "event": event}
-        record.update(self._clean(data))
+        record.update(self._clean(json_safe(data)))
         with self._lock:
             self._seq += 1
             record["seq"] = self._seq
             try:
-                line = json.dumps(record, ensure_ascii=False, default=str)
+                line = json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    default=str,
+                    allow_nan=False,
+                )
                 with open(self.path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
             except Exception:

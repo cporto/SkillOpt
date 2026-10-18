@@ -25,7 +25,7 @@ class TestConsolidateSplit(unittest.TestCase):
             TaskRecord(id="t1", project="p", intent="do Y", split="test"),
             TaskRecord(id="t2", project="p", intent="do Z", split="test"),
         ]
-        train, val = _split(tasks)
+        train, val, _leaked = _split(tasks)
         self.assertEqual(train, [])
         self.assertEqual(val, [])
 
@@ -41,7 +41,7 @@ class TestConsolidateSplit(unittest.TestCase):
                 {"tasks": [t.to_dict() for t in tasks]},
             )
             loaded, _ = load_tasks_file(path)
-            train, val = _split(loaded)
+            train, val, _leaked = _split(loaded)
         self.assertEqual(_ids(train), [])
         self.assertEqual(_ids(val), [])
         self.assertEqual({t.split for t in loaded}, {"test"})
@@ -51,7 +51,7 @@ class TestConsolidateSplit(unittest.TestCase):
             TaskRecord(id="a", project="p", intent="A", split="train"),
             TaskRecord(id="b", project="p", intent="B", split="train"),
         ]
-        train, val = _split(tasks)
+        train, val, _leaked = _split(tasks)
         self.assertEqual(_ids(train), ["a", "b"])
         self.assertEqual(_ids(val), ["a", "b"])
 
@@ -60,7 +60,7 @@ class TestConsolidateSplit(unittest.TestCase):
             TaskRecord(id="tr", project="p", intent="train", split="train"),
             TaskRecord(id="te", project="p", intent="test", split="test"),
         ]
-        train, val = _split(tasks)
+        train, val, _leaked = _split(tasks)
         self.assertEqual(_ids(train), ["tr"])
         self.assertEqual(_ids(val), ["tr"])
         self.assertNotIn("te", _ids(train) + _ids(val))
@@ -71,7 +71,7 @@ class TestConsolidateSplit(unittest.TestCase):
             TaskRecord(id="va", project="p", intent="val", split="val"),
             TaskRecord(id="te", project="p", intent="test", split="test"),
         ]
-        train, val = _split(tasks)
+        train, val, _leaked = _split(tasks)
         self.assertEqual(_ids(train), ["tr"])
         self.assertEqual(_ids(val), ["va"])
 
@@ -81,7 +81,7 @@ class TestConsolidateSplit(unittest.TestCase):
             TaskRecord(id="va", project="p", intent="val", split="holdout"),
             TaskRecord(id="te", project="p", intent="test", split="test"),
         ]
-        train, val = _split(tasks)
+        train, val, _leaked = _split(tasks)
         self.assertEqual(_ids(train), ["tr"])
         self.assertEqual(_ids(val), ["va"])
 

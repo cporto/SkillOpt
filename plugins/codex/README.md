@@ -52,7 +52,8 @@ Codex in natural language:
 Use the skillopt-sleep skill to run status for this project.
 Use the skillopt-sleep skill to run a dry-run for this project.
 Use the skillopt-sleep skill to run the full cycle for this project with the Codex backend.
-Use the skillopt-sleep skill to adopt the latest staged proposal.
+Use the skillopt-sleep skill to inspect status, then adopt the reviewed managed
+proposal or an explicit pending skill subset.
 ```
 
 Or call the engine directly:
@@ -79,7 +80,7 @@ mining, replay, and reflection can be slow and otherwise quiet. Use
 prefer tasks that match the target skill's path, headings, and content. The
 implemented main-CLI flags work the same across the shared integrations, and
 `--preferences "..."` is available for house rules. Advanced keys such as
-`gate_mode`, `dream_rollouts`, and `recall_k` belong in the Sleep config; the
+`gate_mode`, `gate_no_regression`, `dream_rollouts`, and `recall_k` belong in the Sleep config; the
 nightly CLI does not expose `--gate`, `--rollouts-k`, token/time-budget, or
 optimizer/target-split flags. See the
 [shared CLI reference](../README.md#supported-cli-surface).

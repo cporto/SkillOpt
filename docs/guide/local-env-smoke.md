@@ -74,7 +74,6 @@ gradient:
   minibatch_size: 1
   merge_batch_size: 2
   analyst_workers: 1
-  max_analyst_rounds: 1
 
 optimizer:
   learning_rate: 1

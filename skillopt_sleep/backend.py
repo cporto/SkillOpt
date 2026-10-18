@@ -23,8 +23,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import tempfile
+import threading
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
@@ -119,6 +123,31 @@ def keyword_soft_score(reference: str, response: str) -> float:
     resp = _normalize(response)
     hit = sum(1 for t in set(ref_tokens) if t in resp)
     return hit / len(set(ref_tokens))
+
+
+def _optimizer_feedback(task: TaskRecord, result: ReplayResult) -> str:
+    """Return learning-safe feedback while retaining raw evidence elsewhere.
+
+    Recompute semantic rule-judge feedback for legacy/deserialized results that
+    predate ``ReplayResult.optimizer_feedback``. This makes every reflection
+    path safe even when callers construct ReplayResult objects themselves.
+    """
+    if task.reference_kind == "rule" and task.judge:
+        from skillopt_sleep.judges import score_rule_judge_with_feedback
+
+        _hard, _soft, _rationale, feedback = score_rule_judge_with_feedback(
+            task.judge,
+            getattr(result, "response", ""),
+            getattr(result, "tools_called", []),
+        )
+        return feedback
+    feedback = getattr(result, "optimizer_feedback", "")
+    if isinstance(feedback, str) and feedback:
+        return feedback
+    # Legacy results for non-rule judges cannot be safely projected: their raw
+    # rationale may mix semantic guidance with grader internals. Fail closed
+    # rather than feeding that evidence back into an optimizer prompt.
+    return "The response did not satisfy the task's evaluation criteria."
 
 
 # ── Mock backend (deterministic, no API) ──────────────────────────────────────
@@ -329,24 +358,89 @@ class CliBackend(Backend):
         self._cache: Dict[str, str] = {}
         self.last_call_error = ""
         self.last_reflect_raw = ""
+        # Guards _cache/_tokens against concurrent mutation on the opt-in
+        # parallel replay path (SKILLOPT_SLEEP_WORKERS>1). The model call
+        # itself stays outside the lock so parallel workers can overlap.
+        self._lock = threading.Lock()
+        # Per-thread token delta for call-local accounting under parallel replay.
+        self._thread_local = threading.local()
+        # Per-thread marker: set by a backend that self-reports provider usage so
+        # _cached_call/_reflect skip their length-estimate (no double charge).
+        # Thread-local so parallel workers can never read another worker's marker.
+        self._thread_local.charged_in_call = False
 
     # subclasses override --------------------------------------------------
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
         raise NotImplementedError
 
+    def _record_delta(self, delta: int) -> int:
+        """Add a computed delta to the aggregate ``_tokens`` AND record it
+        call-local. The one place both totals are updated, so they always agree.
+        """
+        with self._lock:
+            self._tokens += delta
+        self._thread_local.delta = delta
+        return delta
+
+    def _record_cost(self, prompt: str, response: str) -> int:
+        """THE single path to record an inference's token cost (``len//4``).
+
+        Computes the ``len//4`` delta and delegates to ``_record_delta``. Every
+        inference path (``_cached_call``, ``attempt_with_tools``, ``reflect``)
+        must route cost here so the aggregate and call-local totals always agree
+        and no path under- or over-counts.
+        """
+        delta = len(prompt or "") // 4 + len(response or "") // 4
+        return self._record_delta(delta)
+
+    def _reset_call_delta(self) -> None:
+        """Zero the call-local delta for a NO-CALL path.
+
+        Called at the start of every tool-aware path (and used by cache hits) so
+        a reused worker never reports a previous call's token count — every
+        no-call / early-return path leaves the delta at 0.
+        """
+        self._thread_local.delta = 0
+
     def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
         kind = key.split(":", 1)[0]
         ev = getattr(self, "evidence", None)
-        if key in self._cache:
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached is not None:
+            # cover: later cache hit must not report the previous call's delta.
+            self._reset_call_delta()
             # cache hits log key-only (the full text is on the original miss event)
             if ev is not None:
                 ev.log("replay", "model_call", kind=kind, cache_hit=True, key=key,
                        phase=getattr(self, "evidence_phase", ""), backend=self.name,
                        model=self.model)
-            return self._cache[key]
+            return cached
+        # The model call is intentionally outside the lock so parallel workers
+        # over the same backend overlap; a concurrent miss may duplicate a call,
+        # but _cache/_tokens reads+writes below are atomic.
+        self._thread_local.charged_in_call = False
         out = self._call(prompt, max_tokens=max_tokens)
-        self._tokens += len(prompt) // 4 + len(out) // 4
-        self._cache[key] = out
+        # Charge every real call's tokens once, in one place. A backend that can
+        # report provider usage records it itself (accumulated, exact) and flips
+        # _thread_local.charged_in_call so this path is a no-op — avoiding a
+        # double charge. Every other backend falls back to the len//4 estimate here.
+        # Using a marker keeps _call's str return (which llm_miner/rollout/
+        # slow_update rely on) and preserves those paths' accounting.
+        if not self._thread_local.charged_in_call:
+            self._record_cost(prompt, out)
+        with self._lock:
+            # The cache dedup below may reuse another worker's success, but the
+            # model call above still consumed tokens (already charged).
+            existing = self._cache.get(key)
+            if existing:
+                # A success was cached by another worker; prefer it (dedup) so an
+                # empty/duplicate never overwrites a concurrent success.
+                out = existing
+            elif out:
+                # This worker succeeded and nothing is cached: cache it.
+                self._cache[key] = out
+            # else: empty result + nothing cached -> don't cache (transient failure)
         if ev is not None:
             ev.log("replay", "model_call", kind=kind, cache_hit=False, key=key,
                    phase=getattr(self, "evidence_phase", ""), backend=self.name,
@@ -423,7 +517,7 @@ class CliBackend(Backend):
             try:
                 soft = float(obj.get("score", 0.0))
                 return (1.0 if soft >= 0.8 else 0.0), soft, str(obj.get("reason", ""))[:200]
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         return 0.0, 0.0, "judge-parse-failed"
 
@@ -443,47 +537,25 @@ class CliBackend(Backend):
         target = "skill" if evolve_skill else "memory"
         cur_doc = (skill if target == "skill" else memory) or "(empty)"
         fail_text = "\n".join(
-            f"- wanted: {t.intent[:160]}\n  got: {r.response[:160]}\n  why-wrong: {r.fail_reason[:160]}"
+            f"- wanted: {t.intent[:160]}\n  got: {r.response[:160]}\n"
+            f"  actionable-feedback: {_optimizer_feedback(t, r)[:240]}"
             for t, r in failures[:8]
         )
-        # Aggregate the most common failing criteria across all failures so the
-        # optimizer is told *exactly what the scorer rewards* — gbrain's lesson:
-        # the optimizer kept proposing reasonable-but-wrong edits until it could
-        # see the success criteria.
+        # Aggregate semantic requirements, never raw verifier syntax. Exact
+        # regexes/check expressions stay in ReplayResult.fail_reason and the
+        # evidence log for audit, but are not instructions to the optimizer.
         from collections import Counter
         crit = Counter()
-        for _t, r in failures:
-            fr = r.fail_reason or ""
-            if fr.startswith("failed:"):
-                for part in fr[len("failed:"):].split(","):
-                    part = part.strip()
-                    if part:
-                        crit[part] += 1
-
-        def _explain(c: str) -> str:
-            # translate an "op=arg" criterion into a plain-English requirement
-            if "=" in c:
-                op, _, arg = c.partition("=")
-                op = op.strip(); arg = arg.strip()
-                if op == "max_chars":
-                    return f"the ENTIRE response must be at most {arg} characters long"
-                if op == "min_chars":
-                    return f"the response must be at least {arg} characters long"
-                if op == "section_present":
-                    return f"the response must contain a section/heading titled '{arg}'"
-                if op == "regex":
-                    return f"the response must match the pattern /{arg}/ (e.g. include that label)"
-                if op == "contains":
-                    return f"the response must contain the text '{arg}'"
-                if op == "tool_called":
-                    return f"the agent must actually call the '{arg}' tool"
-            return c
+        for t, r in failures:
+            feedback = _optimizer_feedback(t, r).strip()
+            if feedback:
+                crit[feedback] += 1
 
         criteria_text = ""
         if crit:
             criteria_text = (
-                "\n# Exact criteria the outputs are FAILING (fix these directly)\n"
-                + "\n".join(f"- {_explain(c)}  [{c}, failed {n}x]" for c, n in crit.most_common())
+                "\n# Actionable semantic feedback (fix the behavior, not the verifier)\n"
+                + "\n".join(f"- {c} (observed {n}x)" for c, n in crit.most_common())
             )
         pref_text = ""
         if getattr(self, "preferences", ""):
@@ -519,9 +591,11 @@ class CliBackend(Backend):
                 prompt + "\n\nIMPORTANT: your previous reply was not valid JSON. "
                 "Reply with ONLY the JSON array, no prose, no markdown fences."
             )
+            self._thread_local.charged_in_call = False
             raw = self._call(p, max_tokens=1024)
-            self._tokens += len(p) // 4 + len(raw) // 4
             call_error = getattr(self, "last_call_error", "") or ""
+            if not self._thread_local.charged_in_call:
+                self._record_cost(p, raw)
             if ev is not None:
                 ev.log("reflect", "exchange", target=target, attempt=attempt + 1,
                        backend=self.name, model=self.model,
@@ -562,8 +636,167 @@ class CliBackend(Backend):
                 ))
         return edits
 
+    def _cache_get(self, key: str) -> str | None:
+        """Thread-safe cache read (route subclass cache access through this)."""
+        with self._lock:
+            return self._cache.get(key)
+
+    def _cache_pop_if(self, key: str, expected: str | None) -> None:
+        """Drop a cache entry only if it still holds ``expected``.
+
+        A failed caller must not delete a successful result another worker just
+        stored for the same key, so we only pop our own (empty) value.
+        """
+        with self._lock:
+            if self._cache.get(key) == expected:
+                self._cache.pop(key, None)
+
     def tokens_used(self) -> int:
-        return self._tokens
+        with self._lock:
+            return self._tokens
+
+    def token_delta(self) -> int:
+        """Token cost of the most recent call on THIS thread (call-local)."""
+        return getattr(self._thread_local, "delta", 0)
+
+
+# ── Pi CLI backend ────────────────────────────────────────────────
+
+
+class PiCliBackend(CliBackend):
+    """Drive an authenticated Pi coding-agent CLI in print mode.
+
+    pi (the pi coding agent) speaks the open Agent Skills standard and supports
+    a `-p` / `--print` headless mode, so it slots in alongside the claude/codex
+    CLI backends. Using pi here means the replay model is whatever the user has
+    configured in pi (e.g. `zai/glm-5.2`), keeping source and backend on the same
+    agent — which is the design intent of `--source pi`.
+    """
+
+    name = "pi"
+
+    def __init__(self, model: str = "", pi_path: str = "pi", timeout: int = 180) -> None:
+        super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_PI_MODEL", ""),
+                         timeout=timeout)
+        # npm installs Pi through a ``.cmd`` shim on Windows.  ``which`` honors
+        # PATHEXT there, while expanduser also makes an explicit ``~/bin/pi``
+        # work consistently on every platform.
+        import shutil
+
+        requested = os.path.expanduser(pi_path or "pi")
+        self.pi_path = shutil.which(requested) or requested
+
+    @staticmethod
+    def _stream_text(value: object) -> str:
+        """Normalize subprocess output, including TimeoutExpired byte streams."""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value or "")
+
+    def _set_call_error(self, message: object) -> None:
+        import logging
+
+        from skillopt_sleep.staging import redact_secrets
+
+        text = self._stream_text(message)
+        self.last_call_error = str(redact_secrets(text)).strip()[:500]
+        logging.getLogger("skillopt_sleep").warning(
+            "Pi CLI call failed: %s", self.last_call_error
+        )
+
+    def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Do not make a transient Pi failure sticky in the response cache."""
+        if self._cache_get(key) is not None:
+            # A cached success must not expose an unrelated previous failure
+            # through diagnostics/evidence attached to this call.
+            self.last_call_error = ""
+        out = super()._cached_call(key, prompt, max_tokens=max_tokens)
+        if not out:
+            self._cache_pop_if(key, out)
+        return out
+
+    def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        # Keep credentials/model settings available, but exclude ambient agent
+        # behavior from replay: disable tools and discoverable resources, force
+        # Pi's built-in system prompt, suppress APPEND_SYSTEM.md, and run from a
+        # clean cwd.  (``--no-context-files`` alone only disables AGENTS.md and
+        # CLAUDE.md; it does not disable global SYSTEM.md/APPEND_SYSTEM.md.)
+        #   --no-tools             no tool use during replay
+        #   --no-skills            do not load the user's installed skills
+        #   --no-context-files     do not load AGENTS.md/CLAUDE.md
+        #   --no-session           ephemeral; do not write to session history
+        #   --no-extensions        skip extension discovery
+        import shutil
+
+        self.last_call_error = ""
+        cmd = [self.pi_path, "-p", "--no-session"]
+        cmd += [
+            "--no-tools",
+            "--no-skills",
+            "--no-context-files",
+            "--no-extensions",
+            "--no-prompt-templates",
+            "--no-themes",
+            # An explicit empty custom prompt falls back to Pi's built-in
+            # prompt while preventing discovery of ~/.pi/agent/SYSTEM.md.
+            "--system-prompt",
+            "",
+            # Suppress discovery of ~/.pi/agent/APPEND_SYSTEM.md.
+            "--append-system-prompt",
+            "",
+        ]
+        if self.model:
+            cmd += ["--model", self.model]
+        clean_cwd = tempfile.mkdtemp(prefix="skillopt_sleep_pi_")
+        env = os.environ.copy()
+        # A replay should contact the selected model provider, not Pi's update
+        # or install-telemetry endpoints during startup.
+        env["PI_OFFLINE"] = "1"
+        env["PI_SKIP_VERSION_CHECK"] = "1"
+        env["PI_TELEMETRY"] = "0"
+        try:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    creationflags=_NO_WINDOW,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout,
+                    cwd=clean_cwd,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                detail = ""
+                if exc.stderr:
+                    detail = f": {self._stream_text(exc.stderr)}"
+                self._set_call_error(f"Pi CLI timed out after {self.timeout}s{detail}")
+                return ""
+            except Exception as exc:
+                self._set_call_error(f"Pi CLI failed to start: {exc}")
+                return ""
+        finally:
+            try:
+                shutil.rmtree(clean_cwd, ignore_errors=True)
+            except Exception:
+                pass
+        out = self._stream_text(proc.stdout).strip()
+        stderr = self._stream_text(proc.stderr).strip()
+        if proc.returncode != 0:
+            # Never let stdout from a failed child masquerade as a model
+            # answer; some CLIs print diagnostics to stdout.
+            detail = stderr or out or "no diagnostic output"
+            self._set_call_error(f"Pi CLI exited {proc.returncode}: {detail}")
+            return ""
+        if not out:
+            # A zero exit status is not a usable model response.  Preserve any
+            # stderr diagnostic for operators, but never return it as an answer.
+            detail = f": {stderr}" if stderr else ""
+            self._set_call_error(f"Pi CLI returned an empty response{detail}")
+            return ""
+        return out
 
 
 # ── Claude Code CLI backend ───────────────────────────────────────────────────
@@ -660,13 +893,14 @@ class ClaudeCliBackend(CliBackend):
             try:
                 import shutil
                 shutil.rmtree(clean_cwd, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
         out = (proc.stdout or "").strip()
         self._detect_cli_error(out, proc.stderr or "")
         return out
 
     def attempt_with_tools(self, task, skill, memory, tools):
+        self._reset_call_delta()
         # Expose a REAL, callable `search` tool (a shell shim that logs each
         # call) so the gbrain quick-answerer judge (tool_called=search) is
         # validated honestly: we detect the call from the shim's log, not from
@@ -725,7 +959,7 @@ class ClaudeCliBackend(CliBackend):
                     "Claude CLI could not be executed: %s", exc,
                 )
                 resp = ""
-            self._tokens += len(prompt) // 4 + len(resp) // 4
+            self._record_cost(prompt, resp)
             called: List[str] = []
             if os.path.exists(calllog):
                 with open(calllog) as f:
@@ -735,8 +969,504 @@ class ClaudeCliBackend(CliBackend):
         finally:
             try:
                 shutil.rmtree(work, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
+
+
+_OPENCODE_SYNTHETIC_TOOL_QUERY = "synthetic"
+_OPENCODE_SYNTHETIC_TOOL_RESULT = "Synthetic replay result available."
+_OPENCODE_STREAM_ERRORS = {
+    "malformed_jsonl": "returned malformed JSONL",
+    "invalid_event": "returned an invalid JSONL event",
+    "mixed_session": "returned mixed sessions",
+    "error_event": "emitted an error event",
+    "unexpected_tool_event": "attempted unsupported tool use",
+    "invalid_tool_event": "returned an invalid tool event",
+    "unexpected_tool_id": "used an unexpected tool",
+    "tool_error": "reported a failed synthetic tool",
+    "incomplete_stream": "returned an incomplete stream",
+    "missing_final_text": "returned no final answer after tool use",
+    "empty_response": "returned an empty response",
+}
+
+
+class OpenCodeError(RuntimeError):
+    """An OpenCode failure with a message that is safe to expose to users."""
+
+    def __init__(self, message: str, *, prompt_chars: int = 0) -> None:
+        super().__init__(message)
+        self.prompt_chars = prompt_chars
+
+
+@dataclass(frozen=True)
+class _OpenCodeReplayProject:
+    agent_name: str
+    tool_mapping: Dict[str, str]
+
+
+def resolve_opencode_path(explicit: str = "") -> str:
+    """Find the OpenCode CLI, including Windows npm ``.CMD`` launchers."""
+    candidate = os.path.expanduser(explicit or os.environ.get("SKILLOPT_SLEEP_OPENCODE_PATH", "") or "opencode")
+    resolved = shutil.which(candidate)
+    if resolved:
+        return os.path.abspath(resolved)
+    return os.path.abspath(candidate) if os.path.dirname(candidate) else candidate
+
+
+def _parse_opencode_jsonl_events(raw: str, expected_tool_ids: Optional[set[str]] = None) -> Tuple[str, List[str], str]:
+    """Extract final text and the IDs of validated, completed tool calls from OpenCode JSONL."""
+    text_parts: List[str] = []
+    called: List[str] = []
+    session_id = last_event = ""
+    saw_step_start = False
+    needs_final_text = False
+    known = {"reasoning", "step_finish", "step_start", "text", "tool_use"}
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            return "", [], "malformed_jsonl"
+        if not isinstance(event, dict):
+            return "", [], "invalid_event"
+        event_type, event_session = event.get("type"), event.get("sessionID")
+        if not isinstance(event_type, str) or not event_type:
+            return "", [], "invalid_event"
+        if not isinstance(event_session, str) or not event_session:
+            return "", [], "invalid_event"
+        if session_id and event_session != session_id:
+            return "", [], "mixed_session"
+        session_id = event_session
+        if event_type == "error":
+            return "", [], "error_event"
+        if event_type not in known:
+            continue
+        last_event, part = event_type, event.get("part")
+        if event_type == "text":
+            if not isinstance(part, dict) or part.get("type") != "text":
+                return "", [], "invalid_event"
+            text = part.get("text")
+            if not isinstance(text, str):
+                return "", [], "invalid_event"
+            text_parts.append(text)
+            needs_final_text = needs_final_text and not bool(text.strip())
+        elif event_type == "tool_use":
+            if expected_tool_ids is None:
+                return "", [], "unexpected_tool_event"
+            if not isinstance(part, dict) or part.get("type") != "tool":
+                return "", [], "invalid_tool_event"
+            tool_id, state = part.get("tool"), part.get("state")
+            if not isinstance(tool_id, str) or not isinstance(state, dict):
+                return "", [], "invalid_tool_event"
+            if tool_id not in expected_tool_ids:
+                return "", [], "unexpected_tool_id"
+            if state.get("status") == "error":
+                return "", [], "tool_error"
+            if (
+                state.get("status") != "completed"
+                or state.get("input") != {"query": _OPENCODE_SYNTHETIC_TOOL_QUERY}
+                or state.get("output") != _OPENCODE_SYNTHETIC_TOOL_RESULT
+            ):
+                return "", [], "invalid_tool_event"
+            called.append(tool_id)
+            text_parts.clear()
+            needs_final_text = True
+        elif event_type in {"step_start", "step_finish"}:
+            part_type = "step-start" if event_type == "step_start" else "step-finish"
+            if not isinstance(part, dict) or part.get("type") != part_type:
+                return "", [], "invalid_event"
+            saw_step_start = saw_step_start or event_type == "step_start"
+        elif not isinstance(part, dict) or part.get("type") != "reasoning":
+            return "", [], "invalid_event"
+    if not saw_step_start or last_event != "step_finish":
+        return "", [], "incomplete_stream"
+    if needs_final_text:
+        return "", [], "missing_final_text"
+    text = "\n".join(text_parts).strip()
+    return (text, called, "") if text else ("", [], "empty_response")
+
+
+def _write_exclusive_text(path: str, content: str, encoding: str = "utf-8") -> None:
+    with open(path, "x", encoding=encoding, newline="\n") as output:
+        output.write(content)
+
+
+def _normalize_opencode_tool_names(tools: List[str]) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for value in tools:
+        if not isinstance(value, str):
+            raise OpenCodeError("OpenCode CLI tool replay received an invalid tool list")
+        name, folded = value.strip(), value.strip().casefold()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", name):
+            raise OpenCodeError("OpenCode CLI tool replay received an invalid tool list")
+        if folded not in seen:
+            seen.add(folded)
+            normalized.append(name)
+    if not normalized or len(normalized) > 32:
+        raise OpenCodeError("OpenCode CLI tool replay received an invalid tool list")
+    return normalized
+
+
+def _prepare_opencode_replay_project(work: str, tools: List[str]) -> _OpenCodeReplayProject:
+    """Create a replay project with a Git boundary, offline metadata, and randomly named JavaScript tools."""
+    try:
+        project_id = f"skillopt-sleep-{secrets.token_hex(32)}"
+        git_dir = os.path.join(work, ".git")
+        os.makedirs(os.path.join(git_dir, "objects"))
+        os.makedirs(os.path.join(git_dir, "refs", "heads"))
+        git_files = {
+            "HEAD": "ref: refs/heads/main\n",
+            "config": "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n",
+            "opencode": project_id + "\n",
+        }
+        for name, content in git_files.items():
+            _write_exclusive_text(os.path.join(git_dir, name), content, "ascii")
+        agent = f"skillopt-sleep-{secrets.token_hex(16)}"
+        mapping = {name: f"skillopt_replay_{secrets.token_hex(16)}" for name in tools}
+        if len(set(mapping.values())) != len(mapping):
+            raise ValueError("random tool identifier collision")
+        config_dir, package_name = os.path.join(work, ".opencode"), "skillopt-opencode-replay"
+        tool_dir = os.path.join(config_dir, "tools")
+        os.makedirs(tool_dir)
+        os.makedirs(os.path.join(config_dir, "node_modules"))
+        root = {"name": package_name, "dependencies": {"@opencode-ai/plugin": "0.0.0"}}
+        metadata = {
+            "package.json": {**root, "private": True},
+            "package-lock.json": {
+                "name": package_name,
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": {"": root},
+            },
+        }
+        for name, payload in metadata.items():
+            _write_exclusive_text(os.path.join(config_dir, name), json.dumps(payload, separators=(",", ":")))
+        for logical_name, tool_id in mapping.items():
+            description = f"Controlled synthetic stand-in for the {logical_name} tool."
+            source = (
+                f"const query = {json.dumps(_OPENCODE_SYNTHETIC_TOOL_QUERY)};\n"
+                f"const result = {json.dumps(_OPENCODE_SYNTHETIC_TOOL_RESULT)};\n"
+                "export default {\n"
+                f"  description: {json.dumps(description)},\n"
+                '  args: { query: { type: "string", description: "Use exactly synthetic." } },\n'
+                "  async execute(args) {\n"
+                '    if (args === null || typeof args !== "object" || '
+                "Object.keys(args).length !== 1 || args.query !== query) {\n"
+                '      throw new Error("Invalid synthetic replay input.");\n'
+                "    }\n"
+                "    return result;\n"
+                "  },\n};\n"
+            )
+            _write_exclusive_text(os.path.join(tool_dir, f"{tool_id}.js"), source)
+        return _OpenCodeReplayProject(agent, mapping)
+    except Exception:
+        raise OpenCodeError("OpenCode CLI tool replay could not be prepared") from None
+
+
+def _opencode_temporary_workspace(prefix: str, error: str) -> tempfile.TemporaryDirectory:
+    try:
+        return tempfile.TemporaryDirectory(prefix=prefix, ignore_cleanup_errors=True)
+    except Exception:
+        raise OpenCodeError(error) from None
+
+
+class OpenCodeCliBackend(CliBackend):
+    """Run SkillOpt model calls through the user's OpenCode CLI."""
+
+    name = "opencode"
+
+    def __init__(
+        self,
+        model: str = "",
+        opencode_path: str = "",
+        timeout: int = 180,
+        tool_replay: bool = False,
+    ) -> None:
+        super().__init__(
+            model=model or os.environ.get("SKILLOPT_SLEEP_OPENCODE_MODEL", ""),
+            timeout=timeout,
+        )
+        self.opencode_path = resolve_opencode_path(opencode_path)
+        # Require the literal True so config strings cannot enable synthetic tools.
+        self.tool_replay = tool_replay is True
+
+    def _run_process(
+        self,
+        command: List[str],
+        env: Dict[str, str],
+        work: str,
+        *,
+        operation: str,
+        input_text: Optional[str] = None,
+        report_exit_code: bool = False,
+        exception_action: str = "completed",
+    ) -> subprocess.CompletedProcess[str]:
+        kwargs: Dict[str, Any] = {
+            "capture_output": True,
+            "creationflags": _NO_WINDOW,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": self.timeout,
+            "cwd": work,
+            "env": env,
+        }
+        if input_text is not None:
+            kwargs["input"] = input_text
+        try:
+            proc = subprocess.run(command, **kwargs)
+        except subprocess.TimeoutExpired:
+            raise OpenCodeError(f"{operation} timed out after {self.timeout}s") from None
+        except Exception:
+            raise OpenCodeError(f"{operation} could not be {exception_action}") from None
+        if proc.returncode:
+            detail = f"exited {proc.returncode}" if report_exit_code else "failed"
+            raise OpenCodeError(f"{operation} {detail}")
+        return proc
+
+    def _read_debug_json(
+        self,
+        args: List[str],
+        env: Dict[str, str],
+        work: str,
+        operation: str,
+        report_exit_code: bool = False,
+    ) -> Dict[str, Any]:
+        proc = self._run_process(
+            [self.opencode_path, "debug", *args, "--pure"],
+            env,
+            work,
+            operation=operation,
+            report_exit_code=report_exit_code,
+        )
+        try:
+            value = json.loads(proc.stdout or "")
+        except (ValueError, RecursionError, TypeError):
+            value = None
+        if not isinstance(value, dict):
+            raise OpenCodeError(f"{operation} returned invalid configuration")
+        return value
+
+    @staticmethod
+    def _build_child_environment(work: str, permission: Dict[str, str], tools: bool = False) -> Dict[str, str]:
+        env = os.environ.copy()
+        for key in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"):
+            if env.get(key):
+                env[key] = os.path.abspath(os.path.expanduser(env[key]))
+        env.update(
+            {
+                "NO_COLOR": "1",
+                "OPENCODE_DISABLE_AUTOUPDATE": "1",
+                "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+                "OPENCODE_DISABLE_PROJECT_CONFIG": "0" if tools else "1",
+                "OPENCODE_DISABLE_SHARE": "1",
+                "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
+                "OPENCODE_PERMISSION": json.dumps(permission, separators=(",", ":")),
+                "OPENCODE_PURE": "1",
+            }
+        )
+        npm: Dict[str, str] = {}
+        blocked = {"OPENCODE_DIRECT_TRACE"}
+        if tools:
+            env.update({"OPENCODE_DISABLE_LSP_DOWNLOAD": "1", "OPENCODE_DISABLE_MODELS_FETCH": "1"})
+            npm = {
+                "npm_config_audit": "false",
+                "npm_config_cache": os.path.join(work, ".npm-cache"),
+                "npm_config_fetch_retries": "0",
+                "npm_config_fetch_retry_maxtimeout": "100",
+                "npm_config_fetch_retry_mintimeout": "100",
+                "npm_config_fetch_timeout": "1000",
+                "npm_config_fund": "false",
+                "npm_config_offline": "true",
+                "npm_config_update_notifier": "false",
+            }
+            blocked |= {key.upper() for key in npm} | {
+                "GIT_COMMON_DIR",
+                "GIT_DIR",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_WORK_TREE",
+            }
+        env = {key: value for key, value in env.items() if key.upper() not in blocked}
+        env.update(npm, PWD=work)
+        env.pop("OLDPWD", None)
+        return env
+
+    def _build_run_command(self, work: str, agent: str, title: str) -> List[str]:
+        command = [
+            self.opencode_path,
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--agent",
+            agent,
+            "--title",
+            title,
+            "--dir",
+            work,
+        ]
+        return command + (["--model", self.model] if self.model else [])
+
+    def _read_mcp_config(self, env: Dict[str, str], work: str, stage: str) -> Tuple[Dict[str, Any], Dict[str, bool]]:
+        resolved = self._read_debug_json(["config"], env, work, f"OpenCode CLI {stage}", True)
+        mcp = resolved.get("mcp", {})
+        if not isinstance(mcp, dict) or any(
+            not isinstance(name, str) or not isinstance(entry, dict) for name, entry in mcp.items()
+        ):
+            raise OpenCodeError(f"OpenCode CLI {stage} returned invalid MCP configuration")
+        return resolved, {name: entry.get("enabled") is False for name, entry in mcp.items()}
+
+    def _disable_and_verify_mcp(self, env: Dict[str, str], work: str, config: Dict[str, Any]) -> None:
+        _resolved, discovered = self._read_mcp_config(env, work, "MCP discovery")
+        # Disable every discovered MCP server, including those already disabled.
+        effective = {**config, "mcp": {name: {"enabled": False} for name in sorted(discovered)}}
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(effective, separators=(",", ":"))
+        verified, statuses = self._read_mcp_config(env, work, "MCP verification")
+        if any(not disabled for disabled in statuses.values()):
+            raise OpenCodeError("OpenCode CLI could not disable every configured MCP server")
+        if verified.get("snapshot") is not False:
+            raise OpenCodeError("OpenCode CLI could not disable session snapshots")
+
+    def _verify_tool_allowlist(self, env: Dict[str, str], work: str, agent: str, expected: set[str]) -> None:
+        resolved = self._read_debug_json(["agent", agent], env, work, "OpenCode CLI tool permission verification")
+        tools = resolved.get("tools")
+        if not isinstance(tools, dict) or any(
+            not isinstance(name, str) or not isinstance(value, bool) for name, value in tools.items()
+        ):
+            raise OpenCodeError("OpenCode CLI tool permission verification returned invalid configuration")
+        if {name for name, enabled in tools.items() if enabled} != expected:
+            raise OpenCodeError("OpenCode CLI could not restrict tools to the replay allowlist")
+
+    def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
+        """Keep failed OpenCode calls out of the cache."""
+        if self._cache_get(key) is not None:
+            self.last_call_error = ""
+        out = super()._cached_call(key, prompt, max_tokens=max_tokens)
+        if not out:
+            self._cache_pop_if(key, out)
+        return out
+
+    def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        del max_tokens
+        self.last_call_error = ""
+        try:
+            with _opencode_temporary_workspace(
+                "skillopt_sleep_opencode_",
+                "OpenCode CLI workspace could not be prepared",
+            ) as work:
+                try:
+                    agent = f"skillopt-sleep-{secrets.token_hex(16)}"
+                except Exception:
+                    raise OpenCodeError("OpenCode CLI workspace could not be prepared") from None
+                permission = {"*": "deny"}
+                config = {"snapshot": False, "agent": {agent: {"mode": "primary", "permission": permission}}}
+                env = self._build_child_environment(work, permission)
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+                self._disable_and_verify_mcp(env, work, config)
+                proc = self._run_process(
+                    self._build_run_command(work, agent, "skillopt-sleep"),
+                    env,
+                    work,
+                    operation="OpenCode CLI",
+                    input_text=prompt,
+                    report_exit_code=True,
+                    exception_action="executed",
+                )
+                text, _called, error = _parse_opencode_jsonl_events(proc.stdout or "")
+                if error:
+                    detail = _OPENCODE_STREAM_ERRORS.get(error, "returned an unknown JSONL error")
+                    raise OpenCodeError(f"OpenCode CLI {detail}")
+                return text
+        except OpenCodeError as exc:
+            self.last_call_error = str(exc)
+            return ""
+
+    def attempt_with_tools(
+        self,
+        task: TaskRecord,
+        skill: str,
+        memory: str,
+        tools: List[str],
+    ) -> Tuple[str, List[str]]:
+        self.last_call_error = ""
+        self._reset_call_delta()
+        if not self.tool_replay:
+            self.last_call_error = (
+                "OpenCode CLI tool replay is not supported without explicit "
+                "opencode_tool_replay opt-in"
+            )
+            return "", []
+        try:
+            logical_tools = _normalize_opencode_tool_names(tools)
+            with _opencode_temporary_workspace(
+                "skillopt_sleep_opencode_tools_",
+                "OpenCode CLI tool replay could not be prepared",
+            ) as work:
+                project = _prepare_opencode_replay_project(work, logical_tools)
+                expected = set(project.tool_mapping.values())
+                permission = {"*": "deny", **dict.fromkeys(expected, "allow")}
+                agent_config: Dict[str, Any] = {"mode": "primary", "permission": permission}
+                if self.model:
+                    agent_config["model"] = self.model
+                config: Dict[str, Any] = {
+                    "share": "disabled",
+                    "autoupdate": False,
+                    "formatter": False,
+                    "lsp": False,
+                    "snapshot": False,
+                    "permission": permission,
+                    "agent": {project.agent_name: agent_config},
+                }
+                env = self._build_child_environment(work, permission, True)
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+                self._disable_and_verify_mcp(env, work, config)
+                self._verify_tool_allowlist(env, work, project.agent_name, expected)
+                tool_lines = "\n".join(
+                    f"- Logical tool {json.dumps(name)} is available as `{tool_id}`; when required, "
+                    f'invoke it with {{"query":{json.dumps(_OPENCODE_SYNTHETIC_TOOL_QUERY)}}}.'
+                    for name, tool_id in project.tool_mapping.items()
+                )
+                prompt = (
+                    "Complete the task. Apply the skill and memory rules exactly, including any rule "
+                    "requiring a tool call before answering. Treat a 'Learned preferences' block as hard "
+                    "constraints that override earlier conflicting skill text. The tools below are controlled "
+                    "synthetic stand-ins. Use one only when the task, skill, or memory requires its logical "
+                    "tool; do not call a tool merely because it is listed. When required, invoke the random "
+                    "internal ID instead of claiming that you called it. Each call returns the same fixed result.\n\n"
+                    f"# Controlled tools\n{tool_lines}\n\n# Skill\n{skill or '(none)'}\n\n"
+                    f"# Memory\n{memory or '(none)'}\n\n# Task\n{task.intent}\n\n{task.context_excerpt}\n\n"
+                    "Return only the final answer text."
+                )
+                try:
+                    proc = self._run_process(
+                        self._build_run_command(work, project.agent_name, "skillopt-sleep-tool-replay"),
+                        env,
+                        work,
+                        operation="OpenCode CLI tool replay",
+                        input_text=prompt,
+                        exception_action="executed",
+                    )
+                    text, called_ids, error = _parse_opencode_jsonl_events(proc.stdout or "", expected)
+                    if error:
+                        detail = _OPENCODE_STREAM_ERRORS.get(error, "returned an unknown JSONL error")
+                        raise OpenCodeError(f"OpenCode CLI tool replay {detail}")
+                except OpenCodeError as exc:
+                    raise OpenCodeError(str(exc), prompt_chars=len(prompt)) from None
+                called = set(called_ids)
+                called_tools = [
+                    name for name, tool_id in project.tool_mapping.items() if tool_id in called
+                ]
+        except OpenCodeError as exc:
+            # Prompt-only cost on the error path (no response text).
+            self._record_delta(exc.prompt_chars // 4)
+            self.last_call_error = str(exc)
+            return "", []
+        self._record_cost(prompt, text)
+        return text, called_tools
+
 
 def resolve_codex_path(explicit: str = "") -> str:
     """Find the REAL `@openai/codex` binary, skipping the hermes wrapper.
@@ -788,7 +1518,7 @@ def resolve_codex_path(explicit: str = "") -> str:
             # skip the bash shim that execs hermes
             if head.startswith(b"#!") and b"bash" in head:
                 continue
-        except Exception:
+        except OSError:
             pass
         return c
     return "codex"
@@ -832,7 +1562,8 @@ class CodexCliBackend(CliBackend):
             cmd[3:3] = ["-C", self.project_dir]
         if self.model:
             cmd += ["-m", self.model]
-        cmd += ["--", prompt]
+        # Prompt via stdin (`codex exec -`): the Windows .CMD shim truncates argv at the first CR/LF.
+        cmd += ["-"]
         proc = None
         try:
             try:
@@ -841,8 +1572,11 @@ class CodexCliBackend(CliBackend):
                     capture_output=True,
                     creationflags=_NO_WINDOW,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=self.timeout,
                     cwd=self.project_dir or None,
+                    input=prompt,
                 )
             except subprocess.TimeoutExpired:
                 self.last_call_error = f"codex exec timed out after {self.timeout}s"
@@ -871,7 +1605,7 @@ class CodexCliBackend(CliBackend):
         finally:
             try:
                 os.unlink(out_path)
-            except Exception:
+            except OSError:
                 pass
 
     # Fatal codex failures that will NOT recover on retry — fail fast + loud so a
@@ -916,6 +1650,7 @@ class CodexCliBackend(CliBackend):
         return out
 
     def attempt_with_tools(self, task, skill, memory, tools):
+        self._reset_call_delta()
         # Codex exec runs in a sandbox with shell access; expose the same real
         # `search` shim and let it run (workspace-write so the shim can log).
         import tempfile, shutil, stat
@@ -975,11 +1710,22 @@ class CodexCliBackend(CliBackend):
             ]
             if self.model:
                 cmd += ["-m", self.model]
-            cmd += ["--", prompt]
+            # Prompt via stdin (`codex exec -`): the Windows .CMD shim truncates argv at the first CR/LF.
+            cmd += ["-"]
             self.last_call_error = ""
             proc = None
             try:
-                proc = subprocess.run(cmd, capture_output=True, creationflags=_NO_WINDOW, text=True, timeout=self.timeout, cwd=work)
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    creationflags=_NO_WINDOW,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout,
+                    cwd=work,
+                    input=prompt,
+                )
             except subprocess.TimeoutExpired:
                 self.last_call_error = f"codex exec (tools) timed out after {self.timeout}s"
             except Exception as exc:  # noqa: BLE001
@@ -988,7 +1734,7 @@ class CodexCliBackend(CliBackend):
             try:
                 with open(out_path, encoding="utf-8") as f:
                     resp = f.read().strip()
-            except Exception:
+            except OSError:
                 resp = ""
             # Surface a failed tool-rollout the SAME way _call does: an auth/model/version
             # failure on this path must show up in diagnostics (call_error), not vanish as a
@@ -997,7 +1743,7 @@ class CodexCliBackend(CliBackend):
                 self.last_call_error = (
                     f"codex exec (tools) exited {proc.returncode}: {(proc.stderr or '')[:500]}"
                 )
-            self._tokens += len(prompt) // 4 + len(resp) // 4
+            self._record_cost(prompt, resp)
             called: List[str] = []
             if os.path.exists(calllog):
                 with open(calllog) as f:
@@ -1007,7 +1753,7 @@ class CodexCliBackend(CliBackend):
         finally:
             try:
                 shutil.rmtree(work, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
 
 def resolve_copilot_path(explicit: str = "") -> str:
@@ -1084,7 +1830,7 @@ class CopilotCliBackend(CliBackend):
             )
             try:
                 os.makedirs(self.copilot_home, exist_ok=True)
-            except Exception:
+            except OSError:
                 self.copilot_home = ""
 
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
@@ -1095,7 +1841,12 @@ class CopilotCliBackend(CliBackend):
             "--stream", "off",
             "--no-color",
             "--log-level", "none",
+            # ``--allow-all-tools`` is REQUIRED for non-interactive mode (it waives
+            # the approval prompt); it is the permission axis. Tool *visibility* is
+            # a separate axis: ``--available-tools`` restricts which tools the model
+            # can see at all. Scoping happens there, so we keep both.
             "--allow-all-tools",
+            "--available-tools", os.environ.get("COPILOT_AVAILABLE_TOOLS", "bash"),
             "-C", clean_cwd,
         ]
         if not self.full_env:
@@ -1119,12 +1870,30 @@ class CopilotCliBackend(CliBackend):
             try:
                 import shutil
                 shutil.rmtree(clean_cwd, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
         return self._parse_jsonl_response(proc.stdout or "")
 
     @staticmethod
     def _parse_jsonl_response(raw: str) -> str:
+        """Concatenate assistant text from a Copilot JSONL event stream.
+
+        Behaviourally identical to ``skillopt.model.copilot_backend``'s
+        ``parse_copilot_jsonl``; vendored because this package keeps ZERO
+        dependency on the research package (see the module docstring of
+        ``skillopt_sleep.gate`` for the same arrangement). Keep the two in sync.
+
+        A malformed event must never take down the whole stream: the CLI emits
+        one JSON object per line, so a single bad line loses at most that line's
+        text while the surrounding ``assistant.message`` events still parse.
+        ``data`` is therefore type-checked rather than assumed to be an object.
+        A truthy non-dict (``"text"``, ``5``, a non-empty list) would otherwise
+        raise ``AttributeError`` from the field access, which no caller catches.
+
+        The exception list is deliberately wider than the research-package copy:
+        ``json.loads`` raises ``RecursionError`` rather than ``JSONDecodeError``
+        on a deeply nested payload.
+        """
         parts: List[str] = []
         for line in raw.splitlines():
             line = line.strip()
@@ -1132,15 +1901,21 @@ class CopilotCliBackend(CliBackend):
                 continue
             try:
                 obj = json.loads(line)
-            except Exception:
+            except (ValueError, RecursionError, TypeError):
+                continue
+            if not isinstance(obj, dict):
                 continue
             if obj.get("type") == "assistant.message":
-                content = (obj.get("data") or {}).get("content")
+                data = obj.get("data")
+                if not isinstance(data, dict):
+                    continue
+                content = data.get("content")
                 if isinstance(content, str) and content:
                     parts.append(content)
         return "\n".join(parts).strip()
 
     def attempt_with_tools(self, task, skill, memory, tools):
+        self._reset_call_delta()
         # Expose REAL, callable tool shims in the working directory so the
         # gbrain quick-answerer judge (tool_called=search) is validated
         # honestly: we detect each call from the shim's log, not from a
@@ -1210,7 +1985,13 @@ class CopilotCliBackend(CliBackend):
                 "--stream", "off",
                 "--no-color",
                 "--log-level", "none",
+                # ``--allow-all-tools`` is REQUIRED for non-interactive mode (it
+                # waives the approval prompt); it is the permission axis. Tool
+                # *visibility* is a separate axis: ``--available-tools`` restricts
+                # which tools the model can see at all. Scoping happens there, so
+                # we keep both.
                 "--allow-all-tools",
+                "--available-tools", os.environ.get("COPILOT_AVAILABLE_TOOLS", "bash"),
                 "-C", work,
             ]
             if not self.full_env:
@@ -1229,7 +2010,7 @@ class CopilotCliBackend(CliBackend):
                 resp = self._parse_jsonl_response(proc.stdout or "")
             except Exception:
                 resp = ""
-            self._tokens += len(prompt) // 4 + len(resp) // 4
+            self._record_cost(prompt, resp)
             called: List[str] = []
             if os.path.exists(calllog):
                 with open(calllog) as f:
@@ -1239,7 +2020,7 @@ class CopilotCliBackend(CliBackend):
         finally:
             try:
                 shutil.rmtree(work, ignore_errors=True)
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -1495,11 +2276,28 @@ class DualBackend(Backend):
         self.target = target
         self.optimizer = optimizer
         self.name = f"target={target.name}/optimizer={optimizer.name}"
+        # NOTE: `_target_tokens_before` (snapshotted in attempt/attempt_with_tools
+        # below) is a SHARED instance attribute, not thread-local, and only the
+        # cumulative-only fallback in token_delta() reads it.
+        #
+        # Concurrency contract (replay_batch()'s docstring has the full table):
+        # * a target with token_delta() -> token_delta() returns that target's
+        #   thread-local, call-local delta, so one DualBackend is safe to share
+        #   across parallel replay workers;
+        # * a target with only tokens_used() -> token_delta() falls back to the
+        #   shared snapshot above, which races when workers overlap. Give each
+        #   worker its own DualBackend, or keep SKILLOPT_SLEEP_WORKERS=1.
+        # The cumulative-only fallback is supported sequentially. Do not read the
+        # sequential compatibility tests as a thread-safety guarantee for it.
 
     def attempt(self, task, skill, memory, sample_id: int = 0):
+        # Snapshot the target total before the attempt so token_delta() can report
+        # a before/after diff when the target lacks the per-call delta method.
+        self._target_tokens_before = self.target.tokens_used()
         return self.target.attempt(task, skill, memory, sample_id=sample_id)
 
     def attempt_with_tools(self, task, skill, memory, tools):
+        self._target_tokens_before = self.target.tokens_used()
         return self.target.attempt_with_tools(task, skill, memory, tools)
 
     def judge(self, task, response):
@@ -1518,6 +2316,23 @@ class DualBackend(Backend):
 
     def tokens_used(self):
         return self.target.tokens_used() + self.optimizer.tokens_used()
+
+    def token_delta(self) -> int:
+        # Call-local cost for a replay attempt: replay_one() drives
+        # attempt/attempt_with_tools -> the TARGET backend, so the per-attempt
+        # delta is the target's. The optimizer only appears in replay via
+        # judge() on the rare model-judge fallback (rule/exact/answer tasks are
+        # scored locally, 0 tokens); that cost is still counted in the aggregate
+        # tokens_used() (target + optimizer), so the total is not undercounted.
+        delta_fn = getattr(self.target, "token_delta", None)
+        if delta_fn is not None:
+            return delta_fn()
+        # Compatibility: a target that only implements the older tokens_used()
+        # contract has no per-call delta. Report its same-thread before/after
+        # difference (snapshotted in attempt/attempt_with_tools) so the per-attempt
+        # cost is not silently replaced by a text-length estimate. The snapshot is
+        # shared instance state, so this branch is sequential-only - see __init__.
+        return max(0, self.target.tokens_used() - getattr(self, "_target_tokens_before", 0))
 
 
 # ── Azure OpenAI backend (gpt-5.x via managed identity) ───────────────────────
@@ -1622,6 +2437,31 @@ class AzureOpenAIBackend(CliBackend):
             raw[:100])
         return None
 
+    @staticmethod
+    def _usage_tokens(usage, *, input_field: str, output_field: str) -> Optional[int]:
+        """Provider-reported token total, or ``None`` when usage is unavailable.
+
+        "The provider told us nothing" and "the provider told us zero" are
+        different facts and must not collapse into the same 0. A usage object
+        that carries no token counts (``usage=None``, as some SDK responses
+        leave it, or a stub whose fields are all None) yields ``None`` so the
+        caller keeps the ``len//4`` estimate; a usage object that reports ``0``
+        is authoritative and is charged as exactly zero.
+        """
+        if usage is None:
+            return None
+        raw_in = getattr(usage, input_field, None)
+        raw_out = getattr(usage, output_field, None)
+        if raw_in is None and raw_out is None:
+            return None
+
+        def _as_int(value) -> int:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0
+            return int(value)
+
+        return _as_int(raw_in) + _as_int(raw_out)
+
     def _is_azure_host(self) -> bool:
         from urllib.parse import urlparse
         parsed = urlparse(self.endpoint)
@@ -1684,6 +2524,8 @@ class AzureOpenAIBackend(CliBackend):
         client = self._get_client()
         last_exc = None
         n_attempts = max(1, retries)
+        usage_total = 0
+        usage_reported = False
         for attempt in range(n_attempts):
             try:
                 kwargs: Dict[str, Any] = {
@@ -1705,15 +2547,26 @@ class AzureOpenAIBackend(CliBackend):
                 kwargs['timeout'] = self.timeout
                 resp = client.chat.completions.create(**kwargs)
                 text = (resp.choices[0].message.content or "").strip()
-                try:
-                    u = resp.usage
-                    self._tokens += (getattr(u, "prompt_tokens", 0) or 0) + (getattr(u, "completion_tokens", 0) or 0)
-                except Exception:
-                    pass
+                reported = self._usage_tokens(
+                    getattr(resp, "usage", None),
+                    input_field="prompt_tokens",
+                    output_field="completion_tokens",
+                )
+                if reported is not None:
+                    usage_reported = True
+                    usage_total += reported
                 if text:
                     # A recovered retry must not leave a stale error behind:
                     # last_call_error always reflects the LATEST outcome.
                     self.last_call_error = ""
+                    if usage_reported:
+                        self._record_delta(usage_total)
+                        self._thread_local.charged_in_call = True
+                    else:
+                        # No attempt carried provider usage: leave the marker
+                        # clear so _cached_call's len//4 estimate stands in.
+                        # Reporting a bare 0 here would read as a free call.
+                        self._thread_local.charged_in_call = False
                     return text
                 # empty but no exception: model genuinely returned nothing — one
                 # quick retry can help (reasoning models occasionally yield empty)
@@ -1733,6 +2586,19 @@ class AzureOpenAIBackend(CliBackend):
             self.last_call_error = (
                 f"{self.deployment}: empty response on all {n_attempts} attempts"
             )
+        # Finalize the accumulated provider usage on EVERY exhausted-retry exit,
+        # even when the last attempt raised (the paid empty attempts still count).
+        if usage_reported:
+            # At least one paid attempt reported usage: charge exactly that. The
+            # marker keeps _cached_call from adding its length estimate on top,
+            # and a reported total of 0 stays an authoritative zero.
+            self._record_delta(usage_total)
+            self._thread_local.charged_in_call = True
+        else:
+            # No attempt reported usage: usage is UNKNOWN, not zero. Leave the
+            # marker clear so _cached_call records the len//4 estimate for this
+            # prompt instead of a false free call.
+            self._thread_local.charged_in_call = False
         return ""
 
 
@@ -1804,6 +2670,8 @@ class AzureResponsesBackend(AzureOpenAIBackend):
         last = None
         base_ep = self._next_endpoint()           # this call's primary endpoint
         base_idx = self.endpoints.index(base_ep)
+        usage_total = 0
+        usage_reported = False
         for attempt in range(max(1, retries)):
             # on retry, fail over to the other endpoint(s)
             ep = self.endpoints[(base_idx + attempt) % len(self.endpoints)]
@@ -1814,18 +2682,36 @@ class AzureResponsesBackend(AzureOpenAIBackend):
                     max_output_tokens=16384,
                 )
                 text = (getattr(resp, "output_text", "") or "").strip()
-                try:
-                    u = resp.usage
-                    self._tokens += (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "output_tokens", 0) or 0)
-                except Exception:
-                    pass
+                reported = self._usage_tokens(
+                    getattr(resp, "usage", None),
+                    input_field="input_tokens",
+                    output_field="output_tokens",
+                )
+                if reported is not None:
+                    usage_reported = True
+                    usage_total += reported
                 if text:
+                    if usage_reported:
+                        self._record_delta(usage_total)
+                        self._thread_local.charged_in_call = True
+                    else:
+                        # Provider usage unavailable for this call: keep the
+                        # len//4 estimate in charge instead of a false zero.
+                        self._thread_local.charged_in_call = False
                     return text
                 last = "empty-response"
             except Exception as e:  # noqa: BLE001
                 last = e
             if attempt < retries - 1:
                 _t.sleep(min(8.0, (2 ** attempt) * 0.5) + _r.random() * 0.4)
+        # Same rule as AzureOpenAIBackend: charge accumulated provider usage only
+        # when at least one attempt actually reported it; unknown usage falls back
+        # to _cached_call's len//4 estimate rather than reading as a free call.
+        if usage_reported:
+            self._record_delta(usage_total)
+            self._thread_local.charged_in_call = True
+        else:
+            self._thread_local.charged_in_call = False
         return ""
 
 
@@ -1835,11 +2721,16 @@ def get_backend(
     model: str = "",
     claude_path: str = "claude",
     codex_path: str = "",
+    pi_path: str = "",
     cursor_path: str = "",
+    opencode_path: str = "",
+    opencode_tool_replay: bool = False,
     azure_endpoint: str = "",
     project_dir: str = "",
 ) -> Backend:
     n = (name or "mock").strip().lower()
+    if n in {"pi", "pi_cli", "pi_coding_agent", "pi-coding-agent"}:
+        return PiCliBackend(model=model, pi_path=pi_path or "pi")
     if n in {"claude", "anthropic", "claude_cli", "claude_code"}:
         return ClaudeCliBackend(model=model, claude_path=claude_path)
     if n in {"codex", "codex_cli", "openai_codex"}:
@@ -1853,6 +2744,12 @@ def get_backend(
         return CopilotCliBackend(model=model)
     if n in {"cursor", "cursor_agent", "cursor_cli"}:
         return CursorCliBackend(model=model, cursor_path=cursor_path)
+    if n in {"opencode", "opencode_cli", "opencode-cli"}:
+        return OpenCodeCliBackend(
+            model=model,
+            opencode_path=opencode_path,
+            tool_replay=opencode_tool_replay,
+        )
     if n in {"handoff", "session", "file"}:
         # Lazy import: handoff_backend imports CliBackend from this module.
         from skillopt_sleep.handoff_backend import HandoffBackend
@@ -1872,7 +2769,10 @@ def build_backend(
     target_backend: str = "",
     target_model: str = "",
     codex_path: str = "",
+    pi_path: str = "",
     cursor_path: str = "",
+    opencode_path: str = "",
+    opencode_tool_replay: bool = False,
     azure_endpoint: str = "",
     preferences: str = "",
     project_dir: str = "",
@@ -1890,17 +2790,24 @@ def build_backend(
             backend,
             model=model,
             codex_path=codex_path,
+            pi_path=pi_path,
             cursor_path=cursor_path,
+            opencode_path=opencode_path,
+            opencode_tool_replay=opencode_tool_replay,
             azure_endpoint=azure_endpoint,
             project_dir=project_dir,
         )
         be.preferences = preferences
         return be
     tgt = get_backend(target_backend or backend, model=target_model or model,
-                      codex_path=codex_path, cursor_path=cursor_path, azure_endpoint=azure_endpoint,
+                      codex_path=codex_path, pi_path=pi_path, cursor_path=cursor_path,
+                      opencode_path=opencode_path, opencode_tool_replay=opencode_tool_replay,
+                      azure_endpoint=azure_endpoint,
                       project_dir=project_dir)
     opt = get_backend(optimizer_backend or backend, model=optimizer_model or model,
-                      codex_path=codex_path, cursor_path=cursor_path, azure_endpoint=azure_endpoint,
+                      codex_path=codex_path, pi_path=pi_path, cursor_path=cursor_path,
+                      opencode_path=opencode_path, opencode_tool_replay=opencode_tool_replay,
+                      azure_endpoint=azure_endpoint,
                       project_dir=project_dir)
     opt.preferences = preferences  # reflect runs on the optimizer
     dual = DualBackend(target=tgt, optimizer=opt)

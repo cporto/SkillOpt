@@ -22,10 +22,23 @@ A single `base_url` + `api_key` pair lets you point SkillOpt at, for example:
 | DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
 | Together AI | `https://api.together.xyz/v1` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
+| Novita AI | `https://api.novita.ai/openai/v1` | `zai-org/glm-5.2` |
 | Ollama (local) | `http://localhost:11434/v1` | `qwen2.5:7b` |
 | vLLM / SGLang / TGI | `http://localhost:8000/v1` | your served model |
 | LiteLLM proxy | `http://localhost:4000` | any proxied model |
 | OpenRouter / Fireworks / xAI / … | provider base URL | provider model id |
+| OrcaRouter | `https://api.orcarouter.ai/v1` | `openai/gpt-5.5` |
+| Cheaper Inference | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini` |
+
+[OrcaRouter](https://www.orcarouter.ai) exposes OpenAI, Anthropic, Google,
+DeepSeek and other models behind one OpenAI-compatible endpoint. Its model IDs
+are namespaced by upstream provider (e.g. `openai/gpt-5.5`,
+`anthropic/claude-sonnet-4.6`), so pass a namespaced ID as the model.
+
+Cheaper Inference model IDs are not namespaced (e.g. `gpt-5.4-mini`), so pass
+the bare ID as the model. See its [API docs](https://www.cheaperinference.com/docs)
+for the base URL and its [model list](https://www.cheaperinference.com/markets)
+for the model IDs.
 
 ### Python API
 
@@ -84,8 +97,11 @@ python scripts/train.py --config configs/searchqa/default.yaml \
   model.target=llama-3.3-70b-versatile
 ```
 
-Do not rely on the legacy high-level `model.backend` label to replace the two
-role-specific fields in a structured config.
+`model.backend` is a high-level shorthand for SkillOpt's built-in role
+pairings. It replaces role fields that are still at the shipped
+`openai_chat` default, while non-default role fields are preserved. For a
+custom optimizer/target split, set both role-specific fields and do not combine
+them with a conflicting high-level label.
 
 The generic backend uses the official `openai` SDK and the Chat Completions
 API. It records token usage through the shared tracker, supports provider tool
@@ -170,9 +186,11 @@ A new backend normally requires all of the following:
 6. Update `router.py` only when legacy single-backend compatibility is part of
    the intended feature.
 
-Backend selection in `scripts/train.py` must use
-`model.optimizer_backend` and `model.target_backend`. A high-level
-`model.backend` alias alone is not a substitute for this explicit split.
+Backend selection in `scripts/train.py` must support
+`model.optimizer_backend` and `model.target_backend`. If the backend also has a
+high-level `model.backend` alias, resolve its built-in role pairing before
+applying backend-specific model defaults, without replacing non-default role
+fields.
 
 ## Step 3: test the integration
 

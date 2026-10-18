@@ -15,13 +15,17 @@ basis of the deterministic experiment.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 from collections import Counter
-from typing import Any, Callable, List, Optional, Set, Tuple
+from dataclasses import replace
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from skillopt_sleep.backend import CursorBackendError
 from skillopt_sleep.types import SessionDigest, TaskRecord
+
+_LOGGER = logging.getLogger("skillopt_sleep")
 
 
 def _tid(project: str, intent: str) -> str:
@@ -32,6 +36,18 @@ def _tid(project: str, intent: str) -> str:
 def _short(text: str, n: int = 600) -> str:
     text = (text or "").strip()
     return text if len(text) <= n else text[:n] + " …"
+
+
+def session_skill_hint(digest: SessionDigest) -> str:
+    """Return the session's unambiguous skill, or "" when there is none.
+
+    A session that invoked exactly one skill names the skill its tasks
+    exercised. Zero skills (unknown) and several skills (ambiguous) both
+    return "", which leaves those tasks in the existing catch-all path.
+    """
+    skills = [s for s in (digest.skills_used or []) if s]
+    unique = list(dict.fromkeys(skills))
+    return unique[0] if len(unique) == 1 else ""
 
 
 def _looks_negative(signals: List[str]) -> bool:
@@ -196,6 +212,7 @@ def heuristic_mine(
                 reference="",
                 tags=tags,
                 source_sessions=[d.session_id],
+                skill_hint=session_skill_hint(d),
             )
         )
         if len(tasks) >= max_tasks:
@@ -206,7 +223,10 @@ def heuristic_mine(
 def dedup_tasks(tasks: List[TaskRecord]) -> List[TaskRecord]:
     """Merge tasks sharing an id (same project+intent across sessions)."""
     by_id: dict = {}
+    hints_by_id: dict = {}
     for t in tasks:
+        if t.skill_hint:
+            hints_by_id.setdefault(t.id, set()).add(t.skill_hint)
         if t.id in by_id:
             ex = by_id[t.id]
             ex.source_sessions = list(dict.fromkeys(ex.source_sessions + t.source_sessions))
@@ -216,7 +236,40 @@ def dedup_tasks(tasks: List[TaskRecord]) -> List[TaskRecord]:
                 ex.outcome = t.outcome
         else:
             by_id[t.id] = t
+    for task_id, task in by_id.items():
+        hints = hints_by_id.get(task_id, set())
+        task.skill_hint = next(iter(hints)) if len(hints) == 1 else ""
     return list(by_id.values())
+
+
+def group_tasks_by_skill_hint(
+    tasks: List[TaskRecord],
+    managed_skill_name: str,
+) -> Dict[str, List[TaskRecord]]:
+    """Group mined tasks by their skill hint, in first-seen order.
+
+    A task ID reaches a hinted group only when every observation of it agrees on
+    the same non-empty hint. Missing hints, conflicting hints, and a mixture of
+    hinted and unhinted observations all fall back to ``managed_skill_name`` —
+    the existing catch-all skill — so ambiguous evidence never invents a group.
+    Each task ID is emitted exactly once, with ``dedup_tasks`` merge semantics.
+    """
+    observed: dict = {}
+    for t in tasks:
+        observed.setdefault(t.id, set()).add((t.skill_hint or "").strip())
+
+    # ``dedup_tasks`` merges records in place, so operate on shallow dataclass
+    # copies (including the only list it mutates) rather than caller-owned tasks.
+    copied = [replace(t, source_sessions=list(t.source_sessions)) for t in tasks]
+    groups: Dict[str, List[TaskRecord]] = {}
+    for task in dedup_tasks(copied):
+        hints = observed[task.id]
+        hint = next(iter(hints)) if len(hints) == 1 else ""
+        # Keep the returned record aligned with the normalized evidence used for
+        # routing. In particular, blank and partially observed hints stay empty.
+        task.skill_hint = hint
+        groups.setdefault(hint or managed_skill_name, []).append(task)
+    return groups
 
 
 def assign_splits(
@@ -236,7 +289,10 @@ def assign_splits(
         NEVER placed in val/test.
 
     A stable hash of the task id keeps the same real task in the same split across
-    nights (a fixed held-out gate, like SkillOpt's D_sel/D_test).
+    nights (a fixed held-out gate, like SkillOpt's D_sel/D_test). For a small
+    batch whose hash assignment cannot supply both train and val, the minimum
+    number of test tasks is reassigned and a warning records the reduced test
+    coverage.
 
     Back-compat: if ``test_fraction`` is 0 (default), this behaves like the old
     two-way replay/holdout split — real tasks divide into train + val, no test.
@@ -244,6 +300,17 @@ def assign_splits(
     """
     if holdout_fraction is not None:
         val_fraction = holdout_fraction
+
+    for name, value in (("val_fraction", val_fraction), ("test_fraction", test_fraction)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"{name} must be between 0 and 1 inclusive, got {value}"
+            )
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError(
+            f"val_fraction + test_fraction must be < 1 "
+            f"(got {val_fraction} + {test_fraction})"
+        )
 
     dream = [t for t in tasks if t.origin == "dream"]
     real = [t for t in tasks if t.origin != "dream"]
@@ -254,8 +321,26 @@ def assign_splits(
 
     val_cut = int(round(val_fraction * 100))
     test_cut = val_cut + int(round(test_fraction * 100))
+
+    def _stable_key(task: TaskRecord) -> tuple[int, str]:
+        bucket = int(hashlib.sha256((str(seed) + task.id).encode()).hexdigest(), 16)
+        return bucket, task.id
+
+    promoted_from_test: List[Tuple[str, str]] = []
+
+    def _promote_one(*, to: str, from_splits: set[str]) -> None:
+        """Promote one real task using stable hash order."""
+        candidates = [t for t in real if t.split in from_splits]
+        if not candidates:
+            return
+        candidates.sort(key=_stable_key)
+        selected = candidates[0]
+        if selected.split == "test":
+            promoted_from_test.append((selected.id, to))
+        selected.split = to
+
     for t in real:
-        bucket = int(hashlib.sha256((str(seed) + t.id).encode()).hexdigest(), 16) % 100
+        bucket = _stable_key(t)[0] % 100
         if bucket < val_cut:
             t.split = "val"
         elif bucket < test_cut:
@@ -263,19 +348,33 @@ def assign_splits(
         else:
             t.split = "train"
 
-    # guarantee val (the gate) is non-empty when we have >=2 real tasks
-    real_splits = {t.split for t in real}
-    if len(real) >= 2 and "val" not in real_splits:
-        real[-1].split = "val"
-    # guarantee a train pool exists (dream or real) when possible
+    # Guarantee val (the gate) is non-empty when we have >=2 real tasks. Keep
+    # hash-assigned test tasks untouched unless the non-test pool cannot supply
+    # distinct train and val tasks.
+    if len(real) >= 2 and not any(t.split == "val" for t in real):
+        real_train = [t for t in real if t.split == "train"]
+        train_count = sum(t.split == "train" for t in tasks)
+        if real_train and train_count >= 2:
+            _promote_one(to="val", from_splits={"train"})
+        else:
+            _promote_one(to="val", from_splits={"test"})
+    # Guarantee a train pool exists when possible. Prefer a spare val task; if
+    # the only val task is the gate, borrow from test so val stays non-empty.
     if not any(t.split == "train" for t in tasks) and len(real) >= 2:
-        real[0].split = "train"
-    # if test was requested but ended up empty with >=3 real tasks, carve one
-    if test_fraction > 0 and len(real) >= 3 and not any(t.split == "test" for t in real):
-        for t in real:
-            if t.split == "train":
-                t.split = "test"
-                break
+        val_count = sum(t.split == "val" for t in real)
+        if val_count >= 2:
+            _promote_one(to="train", from_splits={"val"})
+        else:
+            _promote_one(to="train", from_splits={"test"})
+
+    if promoted_from_test:
+        assignments = ", ".join(f"{task_id}->{split}" for task_id, split in promoted_from_test)
+        _LOGGER.warning(
+            "assign_splits reassigned %d test task(s) to keep train and val "
+            "non-empty; held-out test coverage was reduced (%s)",
+            len(promoted_from_test),
+            assignments,
+        )
     return tasks
 
 
@@ -289,13 +388,20 @@ def mine(
     *,
     max_tasks: int = 40,
     candidate_limit: int = 0,
-    holdout_fraction: float = 0.34,
+    val_fraction: float = 0.34,
+    test_fraction: float = 0.0,
+    holdout_fraction: float | None = None,  # legacy alias for val_fraction
     seed: int = 42,
     llm_miner: Optional[Callable[[List[SessionDigest]], List[TaskRecord]]] = None,
     target_skill_text: str = "",
     target_skill_path: str = "",
 ) -> List[TaskRecord]:
-    """Top-level miner. Uses ``llm_miner`` if provided, else heuristic."""
+    """Top-level miner. Uses ``llm_miner`` if provided, else heuristic.
+
+    Split knobs mirror ``assign_splits``: ``val_fraction``/``test_fraction``
+    are the real controls; ``holdout_fraction`` remains the legacy alias and,
+    when passed, overrides ``val_fraction`` (same contract as assign_splits).
+    """
     candidate_limit = candidate_limit or max_tasks
     tasks: List[TaskRecord] = []
     if llm_miner is not None:
@@ -311,5 +417,11 @@ def mine(
     if target_skill_text or target_skill_path:
         tasks = filter_tasks_for_target(tasks, target_skill_text, target_skill_path)
     tasks = tasks[:max_tasks]
-    tasks = assign_splits(tasks, holdout_fraction=holdout_fraction, seed=seed)
+    tasks = assign_splits(
+        tasks,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        holdout_fraction=holdout_fraction,
+        seed=seed,
+    )
     return tasks

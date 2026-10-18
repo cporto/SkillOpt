@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 from skillopt_sleep.backend import get_backend
 from skillopt_sleep.config import load_config
@@ -194,6 +195,96 @@ class TestHandoffCli(unittest.TestCase):
             ])
             # must not crash: corrupt pin -> fresh harvest -> no tasks -> 0
             self.assertEqual(rc, 0)
+
+    def test_completed_run_json_stdout_is_one_parseable_document(self):
+        import contextlib
+        import io
+
+        from skillopt_sleep.__main__ import main
+        from skillopt_sleep.cycle import CycleOutcome
+        from skillopt_sleep.tasks_file import make_tasks_payload, write_tasks_file
+        from skillopt_sleep.types import SleepReport
+
+        with tempfile.TemporaryDirectory() as proj, \
+                tempfile.TemporaryDirectory() as home:
+            tasks_path = os.path.join(proj, "tasks.json")
+            payload = make_tasks_payload(_tasks(), project=proj)
+            payload["reviewed"] = True
+            write_tasks_file(tasks_path, payload)
+            staging_dir = os.path.join(proj, "finished-staging")
+            os.makedirs(staging_dir)
+            outcome = CycleOutcome(
+                report=SleepReport(
+                    night=7,
+                    project=proj,
+                    n_tasks=len(_tasks()),
+                    accepted=True,
+                    gate_action="accept_new_best",
+                ),
+                staging_dir=staging_dir,
+                adopted=False,
+                adopted_paths=[],
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch(
+                "skillopt_sleep.__main__.run_sleep_cycle",
+                return_value=outcome,
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = main([
+                    "run", "--backend", "handoff", "--json",
+                    "--project", proj,
+                    "--claude-home", os.path.join(home, ".claude"),
+                    "--tasks-file", tasks_path,
+                ])
+
+            self.assertEqual(rc, 0)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result["night"], 7)
+            self.assertEqual(result["staging_dir"], staging_dir)
+            self.assertIn("archived round data", stderr.getvalue())
+
+    def test_archive_failure_never_prints_a_success_document(self):
+        import contextlib
+        import io
+
+        from skillopt_sleep.__main__ import main
+        from skillopt_sleep.cycle import CycleOutcome
+        from skillopt_sleep.tasks_file import make_tasks_payload, write_tasks_file
+        from skillopt_sleep.types import SleepReport
+
+        with tempfile.TemporaryDirectory() as proj, \
+                tempfile.TemporaryDirectory() as home:
+            tasks_path = os.path.join(proj, "tasks.json")
+            payload = make_tasks_payload(_tasks(), project=proj)
+            payload["reviewed"] = True
+            write_tasks_file(tasks_path, payload)
+            staging_dir = os.path.join(proj, "finished-staging")
+            os.makedirs(staging_dir)
+            outcome = CycleOutcome(
+                report=SleepReport(night=7, project=proj, accepted=True),
+                staging_dir=staging_dir,
+                adopted=False,
+                adopted_paths=[],
+            )
+            stdout = io.StringIO()
+            with mock.patch(
+                "skillopt_sleep.__main__.run_sleep_cycle", return_value=outcome
+            ), mock.patch(
+                "skillopt_sleep.__main__.os.rename",
+                side_effect=OSError("archive denied"),
+            ), contextlib.redirect_stdout(stdout):
+                rc = main([
+                    "run", "--backend", "handoff", "--json",
+                    "--project", proj,
+                    "--claude-home", os.path.join(home, ".claude"),
+                    "--tasks-file", tasks_path,
+                ])
+            self.assertEqual(rc, 1)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result["ok"], False)
+            self.assertEqual(result["error"], "staging_refused")
+            self.assertNotIn("night", result)
 
     def test_run_with_no_tasks_exits_0_and_advances_harvest_window(self):
         from skillopt_sleep.__main__ import main

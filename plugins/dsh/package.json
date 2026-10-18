@@ -1,0 +1,44 @@
+{
+  "name": "dsh-skillopt",
+  "version": "0.2.1",
+  "description": "Microsoft SkillOpt-Sleep integration for DeepSeek Harness: give your dsh agent a nightly sleep cycle that harvests past sessions, replays recurring tasks, and consolidates validated skills behind a held-out gate.",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "skills",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "skillopt",
+    "skill-optimization",
+    "self-improvement",
+    "memory-consolidation",
+    "sleep"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.1-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  }
+}

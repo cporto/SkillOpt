@@ -26,21 +26,45 @@ from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
 from skillopt.evaluation.gate import GateResult, evaluate_gate, select_gate_score
 from skillopt.gradient.aggregate import merge_patches
-from skillopt.optimizer.meta_skill import run_meta_skill
+from skillopt.model import (
+    chat_optimizer,
+    configure_azure_openai,
+    configure_claude_code_exec,
+    configure_codex_exec_from_config,
+    configure_copilot_chat,
+    configure_copilot_exec,
+    configure_cursor_exec,
+    configure_minimax_chat,
+    configure_openai_compatible,
+    configure_qwen_chat,
+    get_qwen_thinking_modes,
+    get_token_summary,
+    set_optimizer_backend,
+    set_optimizer_deployment,
+    set_reasoning_effort,
+    set_target_backend,
+    set_target_deployment,
+)
+from skillopt.model.common import default_model_for_backend, normalize_backend_name
+from skillopt.optimizer.appendix import (
+    _strip_all_appendix_fields,
+    append_to_appendix_field,
+    inject_empty_appendix_field,
+)
+from skillopt.optimizer.appendix import (
+    extract_appendix_notes as extract_appendix_notes_from_skill,
+)
 from skillopt.optimizer.clip import rank_and_select
 from skillopt.optimizer.lr_autonomous import decide_autonomous_learning_rate
+from skillopt.optimizer.meta_skill import run_meta_skill
 from skillopt.optimizer.rewrite import rewrite_skill_from_suggestions
 from skillopt.optimizer.scheduler import build_scheduler
 from skillopt.optimizer.skill import apply_patch_with_report
-from skillopt.optimizer.appendix import (
-    append_to_appendix_field,
-    extract_appendix_notes as extract_appendix_notes_from_skill,
-    inject_empty_appendix_field,
-    _strip_all_appendix_fields,
-)
 from skillopt.optimizer.skill_aware import (
     configure_skill_aware_reflection,
     consolidate_appendix_notes,
+)
+from skillopt.optimizer.skill_aware import (
     extract_appendix_notes as extract_appendix_notes_from_result,
 )
 from skillopt.optimizer.slow_update import (
@@ -58,24 +82,7 @@ from skillopt.optimizer.update_modes import (
     payload_label,
     short_item_summary,
 )
-from skillopt.model import (
-    chat_optimizer,
-    configure_azure_openai,
-    configure_claude_code_exec,
-    configure_codex_exec,
-    configure_cursor_exec,
-    configure_minimax_chat,
-    configure_qwen_chat,
-    get_token_summary,
-    reset_token_tracker,
-    set_reasoning_effort,
-    set_target_backend,
-    set_target_deployment,
-    set_optimizer_backend,
-    set_optimizer_deployment,
-)
 from skillopt.utils import compute_score, skill_hash
-
 
 # ── Skill-aware reflection: appendix flush ───────────────────────────────────
 
@@ -445,6 +452,98 @@ def _resolve_train_size(cfg: dict, dataloader) -> int:
     return int(train_size)
 
 
+# Role backends the shipped base config sets, which must not defeat --backend.
+_ROLE_BACKEND_DEFAULTS = (None, "", "openai_chat")
+
+
+def _configure_trace_to_optimizer_gates(target_backend: str, cfg: dict) -> None:
+    """Turn on trace-to-optimizer gates for the exec target's trace artifact.
+
+    Sets ``REFLACT_CODEX_TRACE_TO_OPTIMIZER`` (codex) and
+    ``REFLACT_CLAUDE_TRACE_TO_OPTIMIZER`` (claude) to ``"1"`` only when the
+    target actually runs on that exec backend and the matching config knob is
+    on.  ``skillopt.gradient.reflect.fmt_minibatch_trajectories`` reads these
+    env vars, so a non-exec target never pays the injection.
+    """
+    os.environ["REFLACT_CODEX_TRACE_TO_OPTIMIZER"] = (
+        "1"
+        if target_backend == "codex_exec" and cfg.get("codex_trace_to_optimizer", False)
+        else "0"
+    )
+    os.environ["REFLACT_CLAUDE_TRACE_TO_OPTIMIZER"] = (
+        "1"
+        if target_backend == "claude_code_exec" and cfg.get("claude_trace_to_optimizer", False)
+        else "0"
+    )
+
+
+def _resolve_role_backends(
+    backend: str, optimizer_backend: str | None, target_backend: str | None
+) -> tuple[str, str]:
+    """Map a high-level ``--backend`` label onto (optimizer, target) backends.
+
+    ``configs/_base_/default.yaml`` pins both roles to ``openai_chat``, so a
+    resolution guarded only by "is either role unset?" never fired for runs
+    using the shipped defaults and ``--backend`` was silently ignored. A role
+    left at its default value counts as unset; a role the operator pointed at
+    something else always wins.
+    """
+    backend = normalize_backend_name(backend)
+    if backend == "claude_chat":
+        # A chat backend fills BOTH roles, so -- like copilot -- a role pinned
+        # to a default (including the base config's truthy openai_chat) must be
+        # overridden. `x = x or ...` would leave openai_chat in place.
+        if optimizer_backend in _ROLE_BACKEND_DEFAULTS:
+            optimizer_backend = "claude_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "claude_chat"
+    elif backend in {"codex", "codex_exec"}:
+        if optimizer_backend in _ROLE_BACKEND_DEFAULTS:
+            optimizer_backend = "codex_exec"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "codex_exec"
+    elif backend == "claude_code_exec":
+        # Only the *target* defaults to Claude Code (that is what produces the
+        # SDK trace the reflector consumes).  The optimizer keeps its configured
+        # backend (openai_chat by default) so an explicit --optimizer_backend is
+        # never silently overridden and existing users' cost profile is
+        # unchanged.  Opt in with --optimizer_backend claude_code_exec.
+        optimizer_backend = optimizer_backend or "openai_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "claude_code_exec"
+    elif backend == "cursor_exec":
+        optimizer_backend = optimizer_backend or "openai_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "cursor_exec"
+    elif backend == "copilot_chat":
+        # Both roles use the locally installed, CLI-authenticated backend.
+        if optimizer_backend in _ROLE_BACKEND_DEFAULTS:
+            optimizer_backend = "copilot_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "copilot_chat"
+    elif backend == "copilot_exec":
+        optimizer_backend = optimizer_backend or "openai_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "copilot_exec"
+    elif backend == "qwen_chat":
+        optimizer_backend = optimizer_backend or "openai_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "qwen_chat"
+    elif backend == "minimax_chat":
+        optimizer_backend = optimizer_backend or "openai_chat"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "minimax_chat"
+    elif backend == "openai_compatible":
+        if optimizer_backend in _ROLE_BACKEND_DEFAULTS:
+            optimizer_backend = "openai_compatible"
+        if target_backend in _ROLE_BACKEND_DEFAULTS:
+            target_backend = "openai_compatible"
+    else:
+        optimizer_backend = optimizer_backend or "openai_chat"
+        target_backend = target_backend or "openai_chat"
+    return optimizer_backend, target_backend
+
+
 def _compute_task_type_buckets(results: list[dict], task_types: list[str]) -> dict[str, dict]:
     """Compute per-task-type success rates."""
     buckets: dict[str, dict] = {}
@@ -505,7 +604,7 @@ def _extract_failure_patterns(
                     ft = fs.get("failure_type", "")
                     sd = fs.get("description", "")
                     analyst_descs.append(f"{ft}: {sd}" if sd else ft)
-            except Exception:
+            except (ValueError, RecursionError, OSError, AttributeError, TypeError):
                 pass
 
     patterns = []
@@ -602,6 +701,18 @@ class ReflACTTrainer:
         out_root = cfg["out_root"]
         os.makedirs(out_root, exist_ok=True)
 
+        # Backends must be visible during adapter setup.  SpreadsheetBench, for
+        # example, validates its mode against the configured target backend.
+        backend = cfg.get("model_backend", "azure_openai")
+        optimizer_backend, target_backend = _resolve_role_backends(
+            backend, cfg.get("optimizer_backend"), cfg.get("target_backend")
+        )
+        cfg["optimizer_backend"] = optimizer_backend
+        cfg["target_backend"] = target_backend
+        set_optimizer_backend(optimizer_backend)
+        set_target_backend(target_backend)
+        configure_codex_exec_from_config(cfg)
+
         # ── Adapter setup (one-time init) ────────────────────────────
         adapter.setup(cfg)
         dataloader = adapter.get_dataloader()
@@ -631,7 +742,6 @@ class ReflACTTrainer:
             return env_manager, batch.batch_size
 
         # ── Configure models ─────────────────────────────────────────────
-        backend = cfg.get("model_backend", "azure_openai")
         configure_azure_openai(
             endpoint=(
                 cfg.get("azure_openai_endpoint")
@@ -668,45 +778,11 @@ class ReflACTTrainer:
                 cfg.get("target_azure_openai_managed_identity_client_id") or None
             ),
         )
-        optimizer_backend = cfg.get("optimizer_backend")
-        target_backend = cfg.get("target_backend")
-        if not optimizer_backend or not target_backend:
-            if backend in {"claude", "claude_chat"}:
-                optimizer_backend = optimizer_backend or "claude_chat"
-                target_backend = target_backend or "claude_chat"
-            elif backend in {"codex", "codex_exec"}:
-                if optimizer_backend in (None, "", "openai_chat"):
-                    optimizer_backend = "codex_exec"
-                if target_backend in (None, "", "openai_chat"):
-                    target_backend = "codex_exec"
-            elif backend == "claude_code_exec":
-                optimizer_backend = optimizer_backend or "openai_chat"
-                target_backend = target_backend or "claude_code_exec"
-            elif backend in {"cursor", "cursor_exec"}:
-                optimizer_backend = optimizer_backend or "openai_chat"
-                target_backend = target_backend or "cursor_exec"
-            elif backend in {"qwen", "qwen_chat"}:
-                optimizer_backend = optimizer_backend or "openai_chat"
-                target_backend = target_backend or "qwen_chat"
-            else:
-                optimizer_backend = optimizer_backend or "openai_chat"
-                target_backend = target_backend or "openai_chat"
-            cfg["optimizer_backend"] = optimizer_backend
-            cfg["target_backend"] = target_backend
-        set_optimizer_backend(optimizer_backend)
-        set_target_backend(target_backend)
-        set_optimizer_deployment(cfg["optimizer_model"])
-        set_target_deployment(cfg["target_model"])
-        configure_codex_exec(
-            path=cfg.get("codex_exec_path", "codex"),
-            sandbox=cfg.get("codex_exec_sandbox", "workspace-write"),
-            profile=cfg.get("codex_exec_profile", ""),
-            full_auto=cfg.get("codex_exec_full_auto", False),
-            reasoning_effort=cfg.get("codex_exec_reasoning_effort", "none"),
-            use_sdk=cfg.get("codex_exec_use_sdk", None),
-            network_access=cfg.get("codex_exec_network_access", False),
-            web_search=cfg.get("codex_exec_web_search", False),
-            approval_policy=cfg.get("codex_exec_approval_policy", "never"),
+        set_optimizer_deployment(
+            cfg.get("optimizer_model") or default_model_for_backend(optimizer_backend)
+        )
+        set_target_deployment(
+            cfg.get("target_model") or default_model_for_backend(target_backend)
         )
         configure_claude_code_exec(
             path=cfg.get("claude_code_exec_path", "claude"),
@@ -719,6 +795,16 @@ class ReflACTTrainer:
             path=cfg.get("cursor_exec_path") or None,
             sandbox=cfg.get("cursor_exec_sandbox") or None,
         )
+        configure_copilot_exec(
+            path=cfg.get("copilot_exec_path") or None,
+            home=cfg.get("copilot_exec_home") or None,
+            allow_all_tools=cfg.get("copilot_exec_allow_all_tools"),
+        )
+        configure_copilot_chat(
+            optimizer_model=cfg.get("copilot_chat_optimizer_model") or None,
+            target_model=cfg.get("copilot_chat_target_model") or None,
+            timeout=cfg.get("copilot_chat_timeout") or None,
+        )
         configure_qwen_chat(
             base_url=cfg.get("qwen_chat_base_url") or None,
             api_key=cfg.get("qwen_chat_api_key") or None,
@@ -726,20 +812,24 @@ class ReflACTTrainer:
             timeout_seconds=cfg.get("qwen_chat_timeout_seconds"),
             max_tokens=cfg.get("qwen_chat_max_tokens"),
             enable_thinking=cfg.get("qwen_chat_enable_thinking"),
+            thinking_mode=cfg.get("qwen_chat_thinking_mode"),
             optimizer_base_url=cfg.get("optimizer_qwen_chat_base_url") or None,
             optimizer_api_key=cfg.get("optimizer_qwen_chat_api_key") or None,
             optimizer_temperature=cfg.get("optimizer_qwen_chat_temperature"),
             optimizer_timeout_seconds=cfg.get("optimizer_qwen_chat_timeout_seconds"),
             optimizer_max_tokens=cfg.get("optimizer_qwen_chat_max_tokens"),
             optimizer_enable_thinking=cfg.get("optimizer_qwen_chat_enable_thinking"),
+            optimizer_thinking_mode=cfg.get("optimizer_qwen_chat_thinking_mode"),
             target_base_url=cfg.get("target_qwen_chat_base_url") or None,
             target_api_key=cfg.get("target_qwen_chat_api_key") or None,
             target_temperature=cfg.get("target_qwen_chat_temperature"),
             target_timeout_seconds=cfg.get("target_qwen_chat_timeout_seconds"),
             target_max_tokens=cfg.get("target_qwen_chat_max_tokens"),
             target_enable_thinking=cfg.get("target_qwen_chat_enable_thinking"),
+            target_thinking_mode=cfg.get("target_qwen_chat_thinking_mode"),
         )
         configure_minimax_chat(
+            region=cfg.get("minimax_region") or None,
             base_url=cfg.get("minimax_base_url") or None,
             api_key=cfg.get("minimax_api_key") or None,
             temperature=cfg.get("minimax_temperature"),
@@ -749,17 +839,42 @@ class ReflACTTrainer:
         minimax_model_cfg = cfg.get("minimax_model")
         if minimax_model_cfg and cfg.get("target_backend") == "minimax_chat":
             set_target_deployment(str(minimax_model_cfg))
-        os.environ["REFLACT_CODEX_TRACE_TO_OPTIMIZER"] = (
-            "1"
-            if target_backend == "codex_exec" and cfg.get("codex_trace_to_optimizer", False)
-            else "0"
+        configure_openai_compatible(
+            base_url=cfg.get("openai_compatible_base_url") or None,
+            api_key=cfg.get("openai_compatible_api_key") or None,
+            model=cfg.get("openai_compatible_model") or None,
+            temperature=cfg.get("openai_compatible_temperature"),
+            timeout_seconds=cfg.get("openai_compatible_timeout_seconds"),
+            max_tokens=cfg.get("openai_compatible_max_tokens"),
+            optimizer_base_url=cfg.get("optimizer_openai_compatible_base_url") or None,
+            optimizer_api_key=cfg.get("optimizer_openai_compatible_api_key") or None,
+            optimizer_model=(
+                cfg.get("optimizer_model")
+                if cfg.get("optimizer_backend") == "openai_compatible"
+                else (cfg.get("optimizer_openai_compatible_model") or None)
+            ),
+            optimizer_temperature=cfg.get("optimizer_openai_compatible_temperature"),
+            optimizer_timeout_seconds=cfg.get("optimizer_openai_compatible_timeout_seconds"),
+            optimizer_max_tokens=cfg.get("optimizer_openai_compatible_max_tokens"),
+            target_base_url=cfg.get("target_openai_compatible_base_url") or None,
+            target_api_key=cfg.get("target_openai_compatible_api_key") or None,
+            target_model=(
+                cfg.get("target_model")
+                if cfg.get("target_backend") == "openai_compatible"
+                else (cfg.get("target_openai_compatible_model") or None)
+            ),
+
+            target_temperature=cfg.get("target_openai_compatible_temperature"),
+            target_timeout_seconds=cfg.get("target_openai_compatible_timeout_seconds"),
+            target_max_tokens=cfg.get("target_openai_compatible_max_tokens"),
         )
+        _configure_trace_to_optimizer_gates(target_backend, cfg)
         reasoning = cfg.get("reasoning_effort", "") or None
         set_reasoning_effort(reasoning)
         print(
             f"  [model config] backend={backend}  "
-            f"optimizer={cfg['optimizer_model']} ({optimizer_backend})  "
-            f"target={cfg['target_model']} ({target_backend})  "
+            f"optimizer={cfg.get('optimizer_model')} ({optimizer_backend})  "
+            f"target={cfg.get('target_model')} ({target_backend})  "
             f"reasoning={reasoning or 'off'}"
         )
 
@@ -791,7 +906,6 @@ class ReflACTTrainer:
         accumulation = cfg["accumulation"]
         seed = cfg["seed"]
         merge_bs = cfg["merge_batch_size"]
-        max_analyst_rounds = int(cfg.get("max_analyst_rounds", 3) or 3)
         update_mode = normalize_update_mode(cfg.get("skill_update_mode", "patch"))
         lr_control_mode = _normalise_lr_control_mode(cfg.get("lr_control_mode", "fixed"))
         if is_full_rewrite_minibatch_mode(update_mode):
@@ -807,6 +921,8 @@ class ReflACTTrainer:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
         if accumulation <= 0:
             raise ValueError(f"accumulation must be positive, got {accumulation}")
+        if merge_bs < 2:
+            raise ValueError(f"merge_batch_size must be >= 2, got {merge_bs}")
 
         train_size = _resolve_train_size(cfg, dataloader)
         steps_per_epoch = math.ceil(train_size / (batch_size * accumulation))
@@ -821,6 +937,10 @@ class ReflACTTrainer:
         cfg["samples_per_epoch"] = train_size
         cfg["skill_update_mode"] = update_mode
         cfg["lr_control_mode"] = lr_control_mode
+        # Record the resolved Qwen thinking policy: it can come from the
+        # environment, so the raw config alone does not describe the run.
+        if "qwen_chat" in (cfg.get("optimizer_backend"), cfg.get("target_backend"), cfg.get("backend")):
+            cfg["resolved_qwen_thinking_modes"] = get_qwen_thinking_modes()
 
         # Save config after deriving runtime values.
         with open(os.path.join(out_root, "config.json"), "w") as f:
@@ -857,8 +977,7 @@ class ReflACTTrainer:
         print(f"  [config] skill_update_mode={update_mode} "
               f"lr_control_mode={lr_control_mode} "
               f"rewrite_reasoning_effort={rewrite_reasoning_effort or 'off'} "
-              f"rewrite_max_completion_tokens={rewrite_max_completion_tokens} "
-              f"max_analyst_rounds={max_analyst_rounds}")
+              f"rewrite_max_completion_tokens={rewrite_max_completion_tokens}")
         print(f"  [config] longitudinal_pair_policy={longitudinal_pair_policy}")
         print(f"  [config] base_seeds={base_seeds}")
 
@@ -2300,7 +2419,7 @@ class ReflACTTrainer:
 
             # Comparison
             delta_hard = (test_hard or 0) - (baseline_test_hard or 0)
-            print(f"\n  === Improvement vs baseline (init S_0) ===")
+            print("\n  === Improvement vs baseline (init S_0) ===")
             print(
                 f"    [2] best-on-val hard: {baseline_test_hard:.4f} -> {test_hard:.4f}  "
                 f"(delta={delta_hard:+.4f})"

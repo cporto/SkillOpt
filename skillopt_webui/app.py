@@ -25,6 +25,43 @@ from skillopt.config import load_config as load_merged_config
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _ensure_under_project(path: Path) -> Path:
+    """Resolve *path* and fail closed unless it stays under PROJECT_ROOT."""
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(PROJECT_ROOT.resolve())
+    except ValueError:
+        raise ValueError(f"Path escapes project root: {path}")
+    return resolved
+
+
+def _resolve_project_path(user_path: str, *, subdir: str | None = None) -> Path:
+    """Resolve a UI-supplied path, optionally constrained to a project subdir.
+
+    UI callbacks must never trust Gradio component values (e.g. dropdown text):
+    traversal, absolute paths, and symlinks are all rejected here, at the point
+    the path is about to be consumed.
+    """
+    if not user_path:
+        raise ValueError("Path is empty")
+    candidate = Path(user_path)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    resolved = _ensure_under_project(candidate)
+    if subdir is not None:
+        allowed = (PROJECT_ROOT / subdir).resolve()
+        try:
+            resolved.relative_to(allowed)
+        except ValueError:
+            raise ValueError(f"Path must be under {subdir!r}: {user_path}")
+    return resolved
+
+# Gradio moved where `theme` lives across versions: <=5 uses `Blocks(theme=...)`,
+# >=6 moved it to `launch()`. Detect the installed major so the WebUI works on
+# any supported version without an ignored-argument warning or a TypeError.
+_GRADIO_MAJOR = int((getattr(gr, "__version__", "4.0").split(".")[0]) or 4)
+
+
 # ─── Config helpers ──────────────────────────────────────────────────────────
 
 def discover_configs() -> list[str]:
@@ -37,13 +74,84 @@ def discover_configs() -> list[str]:
 
 def load_config(path: str) -> dict:
     """Load a YAML config file."""
-    with open(PROJECT_ROOT / path) as f:
+    config_file = _resolve_project_path(path, subdir="configs")
+    with open(config_file) as f:
         return yaml.safe_load(f)
+
+
+def scan_outputs(out_dir: str) -> list:
+    """Digest experiment results strictly under PROJECT_ROOT.
+
+    The Output Explorer callback. Any path that escapes PROJECT_ROOT is
+    rejected (empty result) at the point data is read, so a traversal arg
+    can never read files outside the project.
+    """
+    rows = []
+    if not out_dir:
+        return rows
+    try:
+        base = _resolve_project_path(out_dir)
+    except ValueError:
+        return rows
+    if not base.exists() or not base.is_dir():
+        return rows
+    for bench_dir in sorted(base.iterdir()):
+        try:
+            bench_dir = _ensure_under_project(bench_dir)
+        except ValueError:
+            continue
+        if not bench_dir.is_dir():
+            continue
+        for run_dir in sorted(bench_dir.iterdir()):
+            try:
+                run_dir = _ensure_under_project(run_dir)
+            except ValueError:
+                continue
+            if not run_dir.is_dir():
+                continue
+            cfg_file = run_dir / "config.yaml"
+            score = "—"
+            steps = "—"
+            if cfg_file.exists():
+                try:
+                    cfg_file = _ensure_under_project(cfg_file)
+                    c = yaml.safe_load(cfg_file.read_text())
+                    steps = str(c.get("train", {}).get("num_steps", "—"))
+                except Exception:
+                    pass
+            # Try to find best score from logs
+            for log_f in run_dir.glob("**/*.jsonl"):
+                try:
+                    log_f = _ensure_under_project(log_f)
+                    with open(log_f) as f:
+                        for line in f:
+                            d = json.loads(line)
+                            if "score" in d:
+                                score = f"{d['score']:.4f}"
+                except Exception:
+                    pass
+            rows.append([
+                run_dir.name,
+                bench_dir.name,
+                score,
+                steps,
+            ])
+    return rows
 
 
 def config_to_display(cfg: dict) -> str:
     """Pretty-print config for display."""
     return yaml.dump(cfg, default_flow_style=False, sort_keys=False)
+
+
+def config_preview(path: str) -> str:
+    """Registered config-preview callback: YAML text for an in-tree config."""
+    if not path:
+        return ""
+    try:
+        return config_to_display(load_config(path))
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
 def _can_connect_to_url(url: str, timeout: float = 0.5) -> bool:
@@ -108,7 +216,8 @@ def validate_training_config(
         if value is not None and value != ""
     ]
     try:
-        cfg = flatten_config(load_merged_config(str(PROJECT_ROOT / config_path), cfg_options))
+        config_file = _resolve_project_path(config_path, subdir="configs")
+        cfg = flatten_config(load_merged_config(str(config_file), cfg_options))
     except Exception as exc:
         return f"❌ Invalid config: {exc}"
 
@@ -468,9 +577,10 @@ def render_pipeline_html(active_stage: str = "") -> str:
 def build_ui():
     configs = discover_configs()
 
-    with gr.Blocks(
-        title="SkillOpt WebUI",
-    ) as app:
+    _blocks_kwargs = {"title": "SkillOpt WebUI"}
+    if _GRADIO_MAJOR < 6:
+        _blocks_kwargs["theme"] = gr.themes.Soft(primary_hue="indigo")
+    with gr.Blocks(**_blocks_kwargs) as app:
         gr.Markdown("# 🧠 SkillOpt Training Dashboard")
         gr.Markdown("*SKILLOPT: Executive Strategy for Self-Evolving Agent Skills — Configure, launch, and monitor training.*")
 
@@ -484,7 +594,7 @@ def build_ui():
                             label="Config File",
                             value=configs[0] if configs else None,
                         )
-                        config_preview = gr.Code(
+                        config_preview_box = gr.Code(
                             label="Config Preview",
                             language="yaml",
                             interactive=False,
@@ -519,15 +629,7 @@ def build_ui():
 
                         status_text = gr.Textbox(label="Status", interactive=False)
 
-                def on_config_change(path):
-                    if path:
-                        try:
-                            return config_to_display(load_config(path))
-                        except Exception as e:
-                            return f"Error: {e}"
-                    return ""
-
-                config_dropdown.change(on_config_change, config_dropdown, config_preview)
+                config_dropdown.change(config_preview, config_dropdown, config_preview_box)
 
                 def on_launch(cfg_path, lr_val, sched, epochs, batch, workers,
                               slow_update, meta_skill, gate):
@@ -596,64 +698,116 @@ def build_ui():
                     label="Experiments",
                 )
 
-                def scan_outputs(out_dir):
-                    rows = []
-                    base = PROJECT_ROOT / out_dir
-                    if not base.exists():
-                        return rows
-                    for bench_dir in sorted(base.iterdir()):
-                        if not bench_dir.is_dir():
-                            continue
-                        for run_dir in sorted(bench_dir.iterdir()):
-                            if not run_dir.is_dir():
-                                continue
-                            cfg_file = run_dir / "config.yaml"
-                            score = "—"
-                            steps = "—"
-                            if cfg_file.exists():
-                                try:
-                                    c = yaml.safe_load(cfg_file.read_text())
-                                    steps = str(c.get("train", {}).get("num_steps", "—"))
-                                except Exception:
-                                    pass
-                            # Try to find best score from logs
-                            for log_f in run_dir.glob("**/*.jsonl"):
-                                try:
-                                    with open(log_f) as f:
-                                        for line in f:
-                                            d = json.loads(line)
-                                            if "score" in d:
-                                                score = f"{d['score']:.4f}"
-                                except Exception:
-                                    pass
-                            rows.append([
-                                run_dir.name,
-                                bench_dir.name,
-                                score,
-                                steps,
-                            ])
-                    return rows
-
                 scan_btn.click(scan_outputs, output_dir, results_table)
 
     return app
+
+
+def build_launch_kwargs(server_name: str, server_port: int, share: bool) -> dict:
+    """Build the launch kwargs exactly as production ``main()`` applies them.
+
+    Gradio 6 moved the theme to ``launch()``; applying it here (rather than in
+    ``build_ui``) keeps the theme on the right object for the installed major
+    without an ignored-argument warning. Tests call this so they exercise the
+    same path a real ``skillopt-webui`` run does instead of injecting their own.
+    """
+    kwargs = dict(server_name=server_name, server_port=server_port, share=share)
+    if _GRADIO_MAJOR >= 6:
+        kwargs["theme"] = gr.themes.Soft(primary_hue="indigo")
+    return kwargs
+
+
+def resolve_auth(auth_user, auth_pass, env=None):
+    """Resolve basic-auth credentials from the CLI flags and the environment.
+
+    Returns ``(user, password)`` when authentication is configured, or ``None``
+    for a deliberately unconfigured local run. Raises ``ValueError`` when a
+    configuration is present but invalid.
+
+    Precedence is per field: a flag supplied on the command line wins over its
+    environment variable. "Not supplied" and "supplied but blank" are different
+    states, because treating them as the same one fails open - ``--auth-user
+    ""`` must not quietly fall back to ``SKILLOPT_WEBUI_USER``, and a pair of
+    blank variables (an empty secret, a template that was never filled in) must
+    not read as "no authentication requested" when the operator meant to
+    require login.
+    """
+    env = os.environ if env is None else env
+
+    def pick(cli_value, env_name, flag):
+        if cli_value is not None:
+            return cli_value, flag
+        if env_name in env:
+            return env[env_name], env_name
+        return None, None
+
+    user, user_src = pick(auth_user, "SKILLOPT_WEBUI_USER", "--auth-user")
+    password, password_src = pick(auth_pass, "SKILLOPT_WEBUI_PASS", "--auth-pass")
+
+    if user_src is None and password_src is None:
+        return None
+    if user_src is None or password_src is None:
+        missing = "--auth-pass" if user_src is not None else "--auth-user"
+        raise ValueError(f"{user_src or password_src} is set but {missing} is not")
+    for value, src in ((user, user_src), (password, password_src)):
+        if not value.strip():
+            raise ValueError(f"{src} is blank")
+    return (user, password)
 
 
 def main():
     parser = argparse.ArgumentParser(description="SkillOpt WebUI")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
-    parser.add_argument("--host", type=str, default="0.0.0.0",
-                        help="Server host. Use 0.0.0.0 for public access.")
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Server host. Default is localhost; use 0.0.0.0 "
+                             "to expose publicly (no auth, use with care).")
+    parser.add_argument("--auth-user", type=str, default=None,
+                        help="Username for basic auth (or set SKILLOPT_WEBUI_USER).")
+    parser.add_argument("--auth-pass", type=str, default=None,
+                        help="Password for basic auth (or set SKILLOPT_WEBUI_PASS).")
     args = parser.parse_args()
 
+    if args.host and args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"⚠ warning: binding SkillOpt WebUI on {args.host} with no auth "
+            "exposes the Output Explorer (reads any path you type) and the "
+            "training controls to reachable clients. Prefer --host 127.0.0.1; "
+            "use 0.0.0.0 only if you understand the risk.",
+            file=sys.stderr,
+        )
+
+    if args.share:
+        print(
+            "⚠ warning: --share creates a public tunnel (gradio.live) with no "
+            "authentication by default. Anyone with the URL can start/stop "
+            "training and browse the filesystem via Output Explorer. "
+            "Use --auth-user / --auth-pass (or SKILLOPT_WEBUI_USER / "
+            "SKILLOPT_WEBUI_PASS) to require login.",
+            file=sys.stderr,
+        )
+
+    # Fail-closed: authentication requires BOTH credentials, from any source.
+    # Supplying only one of them - or supplying blank ones - must not silently
+    # launch the UI unauthenticated (a deployment could expose the training
+    # controls without login).
+    try:
+        auth = resolve_auth(args.auth_user, args.auth_pass)
+    except ValueError as exc:
+        print(
+            f"SKILLOPT_WEBUI authentication is misconfigured: {exc}. Provide both "
+            "--auth-user and --auth-pass (or both SKILLOPT_WEBUI_USER and "
+            "SKILLOPT_WEBUI_PASS) to require login, or neither to run without "
+            "authentication. Refusing to start.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     app = build_ui()
-    app.launch(
-        server_name=args.host,
-        server_port=args.port,
-        share=args.share,
-        theme=gr.themes.Soft(primary_hue="indigo"),
-    )
+    launch_kwargs = build_launch_kwargs(args.host, args.port, args.share)
+    if auth:
+        launch_kwargs["auth"] = auth
+    app.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

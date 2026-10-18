@@ -1,4 +1,5 @@
 """OpenAI-compatible MiniMax chat backend for the target path."""
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,37 @@ from skillopt.model.common import (
     default_model_for_backend,
 )
 
-BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+# The service is reachable through region-specific hostnames, so the selected
+# region decides which OpenAI-compatible base URL the chat calls use.  An
+# explicit ``MINIMAX_BASE_URL`` still wins over the region default.
+REGION_BASE_URLS = {
+    "global_en": "https://api.minimax.io/v1",
+    "cn_zh": "https://api.minimaxi.com/v1",
+}
+DEFAULT_REGION = "global_en"
+
+
+def normalize_region(region: str | None) -> str:
+    """Return a supported region key, defaulting to the global region."""
+    normalized = str(region or "").strip().lower().replace("-", "_")
+    if not normalized:
+        return DEFAULT_REGION
+    if normalized not in REGION_BASE_URLS:
+        raise ValueError(f"Unsupported MiniMax region: {region!r}. Supported values are {sorted(REGION_BASE_URLS)}.")
+    return normalized
+
+
+def base_url_for_region(region: str | None) -> str:
+    """Return the OpenAI-compatible base URL for a region."""
+    return REGION_BASE_URLS[normalize_region(region)]
+
+
+REGION = normalize_region(os.environ.get("MINIMAX_REGION"))
+# An explicit base URL (a proxy or a private gateway) must survive a later
+# region selection, so remember whether the current value was chosen by the
+# user or merely derived from the region default.
+_BASE_URL_EXPLICIT = bool(os.environ.get("MINIMAX_BASE_URL", "").strip())
+BASE_URL = os.environ.get("MINIMAX_BASE_URL", "").strip() or base_url_for_region(REGION)
 API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 TIMEOUT_SECONDS = float(os.environ.get("MINIMAX_TIMEOUT_SECONDS", "300") or 300)
 MAX_TOKENS = int(os.environ.get("MINIMAX_MAX_TOKENS", "8000") or 8000)
@@ -36,6 +67,38 @@ TARGET_DEPLOYMENT = os.environ.get(
     "TARGET_DEPLOYMENT",
     default_model_for_backend("minimax_chat"),
 )
+OPTIMIZER_DEPLOYMENT = os.environ.get(
+    "OPTIMIZER_DEPLOYMENT",
+    default_model_for_backend("minimax_chat"),
+)
+
+# Models whose thinking cannot actually be turned off. Per MiniMax's
+# OpenAI-compatible docs the M2.x family accepts ``{"type": "disabled"}`` but
+# keeps thinking on regardless, so sending "disabled" there is a lie we would
+# then have to reason about downstream. Send the honest value instead.
+_ALWAYS_THINKING_PREFIXES: tuple[str, ...] = ("MiniMax-M2",)
+
+
+def _thinking_is_forced(deployment: str) -> bool:
+    """True when ``deployment`` cannot honor ``thinking: {"type": "disabled"}``."""
+    name = str(deployment or "").strip()
+    return any(name.startswith(prefix) for prefix in _ALWAYS_THINKING_PREFIXES)
+
+
+def _resolve_thinking_type(deployment: str) -> str:
+    """Return the documented top-level ``thinking.type`` for ``deployment``.
+
+    MiniMax documents thinking control as a top-level ``thinking`` object --
+    ``{"thinking": {"type": "adaptive"}}`` or ``{"thinking": {"type":
+    "disabled"}}`` -- NOT as ``chat_template_kwargs.enable_thinking``, which is
+    a Qwen/HuggingFace-serving convention that this endpoint simply ignores.
+    Unknown deployments are treated as capable of adaptive thinking, matching
+    the API default (thinking on when the parameter is omitted).
+    """
+    if _thinking_is_forced(deployment):
+        return "adaptive"
+    return "adaptive" if ENABLE_THINKING else "disabled"
+
 
 _config_lock = threading.Lock()
 tracker = TokenTracker()
@@ -103,8 +166,11 @@ def _compat_message_from_payload(message: dict[str, Any], choice: dict[str, Any]
     )
 
 
-def _post_chat_completion(payload: dict[str, Any], timeout: float | None) -> dict[str, Any]:
-    headers = {"Content-Type": "application/json"}
+def _post_chat_completion(payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
     req = urllib.request.Request(
@@ -144,7 +210,7 @@ def _chat_messages_impl(
         "messages": _json_safe(messages),
         "max_tokens": min(max_completion_tokens, MAX_TOKENS),
     }
-    payload["chat_template_kwargs"] = {"enable_thinking": ENABLE_THINKING}
+    payload["thinking"] = {"type": _resolve_thinking_type(deployment or TARGET_DEPLOYMENT)}
     if TEMPERATURE is not None:
         payload["temperature"] = TEMPERATURE
     if tools:
@@ -171,12 +237,13 @@ def _chat_messages_impl(
             return text, usage_info
         except Exception as e:  # noqa: BLE001
             last_err = e
-            time.sleep(min(2 ** attempt, 30))
+            time.sleep(min(2**attempt, 30))
     raise RuntimeError(f"MiniMax chat call failed after {retries} retries: {last_err}")
 
 
 def configure_minimax_chat(
     *,
+    region: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     temperature: float | str | None = None,
@@ -184,11 +251,21 @@ def configure_minimax_chat(
     max_tokens: int | str | None = None,
     enable_thinking: bool | str | None = None,
 ) -> None:
-    global BASE_URL, API_KEY, TEMPERATURE, TIMEOUT_SECONDS, MAX_TOKENS, ENABLE_THINKING
+    global BASE_URL, API_KEY, TEMPERATURE, TIMEOUT_SECONDS, MAX_TOKENS, ENABLE_THINKING, REGION
+    global _BASE_URL_EXPLICIT
     with _config_lock:
-        if base_url is not None:
-            BASE_URL = str(base_url).strip() or BASE_URL
+        if base_url is not None and str(base_url).strip():
+            BASE_URL = str(base_url).strip()
+            _BASE_URL_EXPLICIT = True
             os.environ["MINIMAX_BASE_URL"] = BASE_URL
+        if region is not None:
+            REGION = normalize_region(region)
+            os.environ["MINIMAX_REGION"] = REGION
+            # Only fill in the region default when no explicit base URL is in
+            # play; otherwise a configured proxy would be silently discarded.
+            if not _BASE_URL_EXPLICIT:
+                BASE_URL = base_url_for_region(REGION)
+                os.environ["MINIMAX_BASE_URL"] = BASE_URL
         if api_key is not None:
             API_KEY = str(api_key).strip()
             os.environ["MINIMAX_API_KEY"] = API_KEY
@@ -214,6 +291,14 @@ def get_max_tokens() -> int:
     return MAX_TOKENS
 
 
+def get_region() -> str:
+    return REGION
+
+
+def get_base_url() -> str:
+    return BASE_URL
+
+
 def chat_target(
     system: str,
     user: str,
@@ -222,7 +307,7 @@ def chat_target(
     stage: str = "target",
     reasoning_effort: str | None = None,
     timeout: float | None = None,
-) -> tuple[str, dict[int]]:
+) -> tuple[str, dict[str, int]]:
     del reasoning_effort
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     return _chat_messages_impl(
@@ -230,6 +315,7 @@ def chat_target(
         max_completion_tokens,
         retries,
         stage,
+        deployment=TARGET_DEPLOYMENT,
         timeout=timeout,
     )
 
@@ -242,20 +328,22 @@ def chat_optimizer(
     stage: str = "optimizer",
     reasoning_effort: str | None = None,
     timeout: float | None = None,
-) -> tuple[str, dict[int]]:
+) -> tuple[str, dict[str, int]]:
     """Optimizer chat call. Backend stores the trained skill; uses the same
     MiniMax-proxied OpenAI-compat endpoint as `chat_target`. Added in the
     parallel-training fix; previously missing in skillopt 0.2.0's
-    miniamax backend, which forced the dispatcher into _openai.chat_optimizer
+    minimax backend, which forced the dispatcher into _openai.chat_optimizer
     (Azure) and produced "[skip] no usable patches" for any user running
     optimizer+target on `minimax_chat`.
     """
+    del reasoning_effort
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     return _chat_messages_impl(
         messages,
         max_completion_tokens,
         retries,
         stage,
+        deployment=OPTIMIZER_DEPLOYMENT,
         timeout=timeout,
     )
 
@@ -281,6 +369,33 @@ def chat_target_messages(
         tools=tools,
         tool_choice=tool_choice,
         return_message=return_message,
+        deployment=TARGET_DEPLOYMENT,
+        timeout=timeout,
+    )
+
+
+def chat_optimizer_messages(
+    messages: list[dict[str, Any]],
+    max_completion_tokens: int = 16384,
+    retries: int = 5,
+    stage: str = "optimizer",
+    reasoning_effort: str | None = None,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    return_message: bool = False,
+    timeout: float | None = None,
+) -> tuple[Any, dict[str, int]]:
+    del reasoning_effort
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        tools=tools,
+        tool_choice=tool_choice,
+        return_message=return_message,
+        deployment=OPTIMIZER_DEPLOYMENT,
         timeout=timeout,
     )
 
@@ -301,3 +416,9 @@ def set_target_deployment(deployment: str) -> None:
     global TARGET_DEPLOYMENT
     TARGET_DEPLOYMENT = deployment or default_model_for_backend("minimax_chat")
     os.environ["TARGET_DEPLOYMENT"] = TARGET_DEPLOYMENT
+
+
+def set_optimizer_deployment(deployment: str) -> None:
+    global OPTIMIZER_DEPLOYMENT
+    OPTIMIZER_DEPLOYMENT = deployment or default_model_for_backend("minimax_chat")
+    os.environ["OPTIMIZER_DEPLOYMENT"] = OPTIMIZER_DEPLOYMENT

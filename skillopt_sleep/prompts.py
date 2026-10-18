@@ -33,19 +33,32 @@ _MINER = """You are mining a user's past AI-assistant sessions to find RECURRING
 worth optimizing a skill for. From the session below, extract 0-3 reusable tasks.
 
 A good task is something the user asks for repeatedly or had to correct, where a
-GENERAL rule would help next time (formatting, structure, tool-use, conventions).
-Skip one-off or purely exploratory requests.
+GENERAL rule would help next time (correctness, completeness, tool-use,
+conventions). Skip one-off or purely exploratory requests.
 
 For each task return:
   - "intent": the reusable request, generalized (no one-off specifics)
   - "checks": a list of programmatic success checks a grader can run on a future
-     answer. Each check is one of:
-        {"op":"section_present","arg":"<heading text>"}
-        {"op":"regex","arg":"<python regex the answer must match>"}
-        {"op":"contains","arg":"<substring the answer must contain>"}
+     answer. Give every check a plain-language "description" of the intended
+     behavior; it must not repeat regex or grader syntax. Prefer checks about
+     WHAT THE ANSWER DOES over how it is formatted:
+        {"op":"contains","arg":"<required substring>","description":"<semantic requirement>"}
+        {"op":"not_contains","arg":"<prohibited substring>","description":"<semantic requirement>"}
+        {"op":"no_refusal","description":"Complete the requested task instead of refusing"}
+        {"op":"regex","arg":"<python regex>","description":"<meaning of the pattern, without its syntax>"}
+        {"op":"tool_called","arg":"<required tool>","description":"<why the tool must be used>"}
+     Formatting checks are available but weak, because an assistant can satisfy
+     them by reformatting without answering any better. Use them only alongside
+     an outcome check, never alone:
+        {"op":"section_present","arg":"<strict heading text>"}
+        {"op":"section_contains","arg":"<literal text anywhere in an ATX heading>"}
         {"op":"max_chars","arg":<int>}
+        {"op":"min_chars","arg":<int>}
      Only include checks you are confident a GOOD answer must satisfy.
-  - "rubric": a one-sentence description of what a good answer looks like
+  - "rubric": a one-sentence description of what a GOOD answer achieves —
+     judged on substance, not on wording or layout. ALWAYS provide this. It is
+     the primary grader, because an assistant can satisfy any literal-string
+     check simply by emitting that string.
   - "satisfied": true/false — did the user seem satisfied with the assistant's answer?
 
 Return ONLY a JSON array (possibly empty). No prose.
@@ -80,12 +93,12 @@ _REFLECT = (
     "tasks below. Propose at most __EDIT_BUDGET__ bounded edits to the "
     "__TARGET__ document so it stops failing. Each edit MUST be a short, "
     "GENERAL, reusable rule or preference (never task-specific, never an "
-    "answer to a single task). If exact failing criteria are listed, your "
-    "edits MUST make future outputs satisfy every one of them.\n"
-    "BE CONCRETE: quote the exact threshold, section name, or format from "
-    "the criteria verbatim in your rule (e.g. write 'keep the entire "
-    "response under 1200 characters', NOT 'respect length limits'). Vague "
-    "rules do not change behavior; specific numeric/structural rules do.\n"
+    "answer to a single task). Use the actionable semantic feedback to fix "
+    "user-visible behavior, not to imitate the evaluator.\n"
+    "BE CONCRETE about public task requirements such as thresholds and section "
+    "names, but NEVER quote or reconstruct private verifier implementation "
+    "details such as regexes, check expressions, or judge source text. Vague "
+    "rules do not change behavior, while verifier-specific rules overfit.\n"
     "IMPORTANT: your edits are APPENDED to a 'Learned preferences' block; "
     "you CANNOT delete the existing instructions above. If the current "
     "__TARGET__ text conflicts with a criterion (e.g. it says 'be exhaustive' "

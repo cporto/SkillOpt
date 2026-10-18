@@ -63,6 +63,14 @@ def _iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
         return
 
 
+def _safe_mtime(path: str) -> float:
+    """Return a sortable mtime without failing on a concurrently removed file."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def _text_from_content(content: Any) -> str:
     """Flatten a message.content (str or list of blocks) into text."""
     if isinstance(content, str):
@@ -83,6 +91,34 @@ def _tool_names_from_content(content: Any) -> List[str]:
         for b in content:
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name"):
                 names.append(str(b["name"]))
+    return names
+
+
+def _skill_names_from_content(content: Any) -> List[str]:
+    """Extract skill targets from Claude ``Skill`` tool-use blocks.
+
+    Only well-formed invocations count: the block type must be ``tool_use``,
+    its name exactly ``Skill``, and ``input.skill`` a non-blank string. The
+    name is returned whitespace-trimmed but otherwise verbatim; no other tool
+    input and no tool output is read.
+    """
+    names: List[str] = []
+    if not isinstance(content, list):
+        return names
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") != "tool_use" or b.get("name") != "Skill":
+            continue
+        args = b.get("input")
+        if not isinstance(args, dict):
+            continue
+        skill = args.get("skill")
+        if not isinstance(skill, str):
+            continue
+        skill = skill.strip()
+        if skill:
+            names.append(skill)
     return names
 
 
@@ -133,8 +169,12 @@ _REPLAY_PROMPT_MARKERS = (
     "You are a strict grader",
     "Score the response 0.0-1.0",
     "You are SkillOpt-Sleep",
+    "You are an expert success-pattern analyst",
+    "You are an expert failure-pattern analyst",
     "## TASK\n",
     "## SKILL\n",
+    # Engine rollouts render the skill under this heading before the task.
+    "## Skill\n",
 )
 
 
@@ -206,6 +246,7 @@ def digest_transcript(path: str) -> Optional[SessionDigest]:
     user_prompts: List[str] = []
     assistant_finals: List[str] = []
     tools: List[str] = []
+    skills: List[str] = []
     files: List[str] = []
     feedback: List[str] = []
     n_user = 0
@@ -232,7 +273,16 @@ def digest_transcript(path: str) -> Optional[SessionDigest]:
         role = msg.get("role")
         content = msg.get("content")
         if role == "user":
+            # Claude Code marks text it injects on the user's behalf with
+            # isMeta: a loaded skill's SKILL.md body, messages relayed from
+            # other sessions, usage-limit notices. The user typed none of it.
+            # A body that names a known agent session is still kept, so
+            # _is_agent_session can drop the whole session as before.
             text = _text_from_content(content)
+            if rec.get("isMeta") is True and not any(
+                marker in text for marker in _AGENT_SESSION_MARKERS
+            ):
+                continue
             if text and not _is_meta_prompt(text):
                 n_user += 1
                 user_prompts.append(text.strip())
@@ -240,6 +290,7 @@ def digest_transcript(path: str) -> Optional[SessionDigest]:
         elif role == "assistant":
             n_asst += 1
             tools.extend(_tool_names_from_content(content))
+            skills.extend(_skill_names_from_content(content))
             text = _text_from_content(content)
             if text.strip():
                 assistant_finals.append(text.strip())
@@ -266,12 +317,48 @@ def digest_transcript(path: str) -> Optional[SessionDigest]:
         user_prompts=user_prompts,
         assistant_finals=assistant_finals[-5:],  # last few finals are the useful ones
         tools_used=_dedup(tools),
+        skills_used=_dedup(skills),
         files_touched=_dedup(files),
         feedback_signals=feedback,
         n_user_turns=n_user,
         n_assistant_turns=n_asst,
         raw_path=path,
     )
+
+
+def _git_root(path: str) -> str:
+    """Nearest ancestor of `path` holding a .git entry, else "".
+
+    A .git *file* (worktree/submodule) counts too, so `os.path.exists` is used
+    rather than isdir.
+    """
+    cur = os.path.abspath(path)
+    while True:
+        if os.path.exists(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+def _ancestor_in_scope(ancestor: str, invoked: str) -> bool:
+    """True when a session rooted at `ancestor` may belong to `invoked`.
+
+    A session started higher up than the invoked project is in scope only when
+    it is still inside the invoked project's git root, so invoking from
+    `repo/sub` keeps the sessions started at `repo`. $HOME and the filesystem
+    root are never in scope: they are shared by every project, so admitting
+    them is what previously pulled every $HOME-rooted session into every
+    project below it. Without a git root the ancestor walk stops there.
+    """
+    home = os.path.abspath(os.path.expanduser("~"))
+    if ancestor in (home, os.path.abspath(os.sep)):
+        return False
+    root = _git_root(invoked)
+    if root:
+        return ancestor == root or ancestor.startswith(root + os.sep)
+    return True
 
 
 def _project_matches(project: str, scope: Any, invoked: str) -> bool:
@@ -284,7 +371,11 @@ def _project_matches(project: str, scope: Any, invoked: str) -> bool:
         return True
     a = os.path.abspath(project)
     b = os.path.abspath(invoked)
-    return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)
+    if a == b or a.startswith(b + os.sep):
+        return True
+    if not b.startswith(a + os.sep):
+        return False
+    return _ancestor_in_scope(a, b)
 
 
 def harvest(
@@ -319,7 +410,7 @@ def harvest(
             if fn.endswith(".jsonl") and not fn.startswith("agent-"):
                 paths.append(os.path.join(root, fn))
     # newest first by mtime
-    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    paths.sort(key=_safe_mtime, reverse=True)
 
     for p in paths:
         d = digest_transcript(p)

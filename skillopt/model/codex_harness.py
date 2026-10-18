@@ -2,20 +2,30 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import traceback
+import warnings
 from typing import Any
 
 from skillopt.model.backend_config import (
+    build_codex_exec_cli_config_overrides,
     get_claude_code_exec_config,
     get_codex_exec_config,
+    get_copilot_exec_config,
     get_cursor_exec_config,
     get_target_backend,
+    validate_exec_sandbox,
+)
+from skillopt.model.copilot_backend import (
+    build_copilot_subprocess_env,
+    parse_copilot_jsonl,
 )
 
 ANSWER_SCHEMA: dict[str, Any] = {
@@ -62,6 +72,25 @@ def render_skill_md(
         "",
     ])
     return "\n".join(chunks)
+
+
+def _is_symlink_privilege_error(exc: OSError) -> bool:
+    """Return True only for the Windows 'symlink privilege not held' case.
+
+    We must not mask a real collision/error by silently falling back to a copy;
+    only the case where the OS refuses to create a symlink because the caller
+    lacks SeCreateSymbolicLinkPrivilege (Windows Developer Mode / elevation)
+    should fall back to a copy inside a private work dir.
+    """
+    if getattr(exc, "winerror", None) in (1314,):  # ERROR_PRIVILEGE_NOT_HELD
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in {
+            getattr(errno, "EPERM", -1),
+            getattr(errno, "ENOTSUP", -1),
+            getattr(errno, "EOPNOTSUPP", -1),
+        }
+    return False
 
 
 def prepare_workspace(
@@ -111,7 +140,22 @@ def prepare_workspace(
             parent = os.path.dirname(dst)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            os.symlink(os.path.abspath(src), dst)
+            src_abs = os.path.abspath(src)
+            if os.path.lexists(dst):
+                raise FileExistsError(
+                    f"link destination already exists: {dst} (from {src})"
+                )
+            try:
+                os.symlink(src_abs, dst, target_is_directory=os.path.isdir(src_abs))
+            except OSError as exc:
+                # Fail closed: only fall back for the Windows symlink-privilege
+                # case, and never merge into an existing destination.
+                if not _is_symlink_privilege_error(exc):
+                    raise
+                if os.path.isdir(src_abs):
+                    shutil.copytree(src_abs, dst)
+                else:
+                    shutil.copy2(src_abs, dst)
 
     attachment_lines: list[str] = []
     if images:
@@ -279,7 +323,7 @@ def _persist_artifacts(
     response: str,
     prefix: str,
     summary_builder,
-) -> None:
+) -> str:
     pred_dir = os.path.dirname(work_dir.rstrip(os.sep))
     raw_path = os.path.join(pred_dir, f"{prefix}_raw.txt")
     summary_path = os.path.join(pred_dir, f"{prefix}_trace_summary.txt")
@@ -294,6 +338,7 @@ def _persist_artifacts(
         f.write(combined_raw)
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(summary_builder(combined_raw, response))
+    return combined_raw
 
 
 def _persist_codex_artifacts(work_dir: str, raw: str, response: str) -> None:
@@ -307,13 +352,22 @@ def _persist_codex_artifacts(work_dir: str, raw: str, response: str) -> None:
 
 
 def _persist_claude_artifacts(work_dir: str, raw: str, response: str) -> None:
-    _persist_artifacts(
+    combined_raw = _persist_artifacts(
         work_dir=work_dir,
         raw=raw,
         response=response,
         prefix="claude",
         summary_builder=_build_claude_trace_summary,
     )
+    # Structured trace steps for the reflector (issue #233): expose what the
+    # agent actually did, not just the collapsed final answer.  Format from the
+    # *combined* raw (across turns) and write unconditionally so a turn that
+    # parses to no steps never leaves the previous turn's stale file behind.
+    steps_text = format_claude_trace_steps(combined_raw)
+    pred_dir = os.path.dirname(work_dir.rstrip(os.sep))
+    steps_path = os.path.join(pred_dir, "claude_trace_steps.txt")
+    with open(steps_path, "w", encoding="utf-8") as f:
+        f.write(steps_text)
 
 
 def _persist_cursor_artifacts(work_dir: str, raw: str, response: str) -> None:
@@ -421,6 +475,129 @@ def extract_codex_trace_prefix(raw: str, *, after_step: int) -> str:
     lines = parsed["trace_body"].splitlines()
     end_line = int(steps[clamped - 1]["end_line"]) - int(steps[0]["start_line"])
     return "\n".join(lines[:end_line]).strip()
+
+
+# ── Claude Code trace steps (SDK messages → compact steps) ──────────────────
+# The Claude Code SDK serializes its full session into ``messages``: most
+# entries are bookkeeping (init / thinking_tokens), the rest are assistant text,
+# tool calls, and tool results.  Flatten those into numbered steps so the
+# reflector can see what the agent actually did without paying the full raw
+# payload size.
+
+
+def _claude_step_truncate(text: str, limit: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...[+{len(text) - limit} chars]"
+
+
+def _summarize_claude_tool_call(name: str, input_data: Any) -> str:
+    name = str(name or "")
+    if isinstance(input_data, dict):
+        if name == "Read":
+            return f"Read {input_data.get('file_path', '')}"
+        if name == "Glob":
+            return f"Glob {input_data.get('pattern', '')}"
+        if name == "Grep":
+            return f"Grep {input_data.get('pattern', '')}"
+        if name == "Bash":
+            return f"Bash {input_data.get('command', '')}"
+    return _claude_step_truncate(f"{name} {json.dumps(input_data, ensure_ascii=False)}", 500)
+
+
+def _iter_claude_json_blocks(raw: str):
+    """Yield each JSON object embedded in ``raw``.
+
+    ``run_claude_code_exec`` prefixes every attempt with a
+    ``===== CLAUDE ... ATTEMPT n =====`` header, so the persisted payload is not
+    a single JSON document.  Split on those headers and parse each block.
+    """
+    for chunk in re.split(r"(?m)^={5,}.*={5,}\s*$", raw or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            yield json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+
+
+def parse_claude_trace_steps(raw: str) -> list[dict]:
+    """Parse serialized Claude Code SDK messages into ordered, compact steps.
+
+    Returns a list of ``{"index", "type", "summary"}`` dicts where ``type`` is
+    one of ``text`` / ``tool_call`` / ``tool_result``.  System bookkeeping
+    events (init, thinking tokens) are dropped; tool results are truncated to
+    keep the trace small.
+    """
+    steps: list[dict] = []
+    for block in _iter_claude_json_blocks(raw):
+        messages = block.get("messages") if isinstance(block, dict) else None
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("subtype") in {"init", "thinking_tokens"}:
+                continue
+            data = message.get("data")
+            if isinstance(data, dict) and data.get("type") == "system":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                # Terminal result message carries the final text.
+                text = str(message.get("result") or "").strip()
+                if text:
+                    steps.append({"type": "text", "summary": _claude_step_truncate(text, 500)})
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if "name" in item and "input" in item:
+                    steps.append({
+                        "type": "tool_call",
+                        "summary": _summarize_claude_tool_call(item.get("name"), item.get("input")),
+                    })
+                elif "tool_use_id" in item:
+                    body = item.get("content")
+                    if isinstance(body, list):
+                        text_parts: list[str] = []
+                        for part in body:
+                            if isinstance(part, dict):
+                                # Anthropic content blocks carry their payload
+                                # under ``text`` (tool_result content is
+                                # ``[{"type": "text", "text": "..."}]``), not
+                                # ``content``.
+                                part_text = part.get("text")
+                                if isinstance(part_text, str):
+                                    text_parts.append(part_text)
+                            elif isinstance(part, str):
+                                text_parts.append(part)
+                        body = "\n".join(text_parts)
+                    summary = _claude_step_truncate(body, 200)
+                    if item.get("is_error"):
+                        summary = f"[error] {summary}"
+                    steps.append({"type": "tool_result", "summary": summary})
+                else:
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        steps.append({"type": "text", "summary": _claude_step_truncate(text, 500)})
+    for index, step in enumerate(steps, 1):
+        step["index"] = index
+    return steps
+
+
+def format_claude_trace_steps(raw: str, *, max_chars: int = 4000) -> str:
+    """Render parsed Claude Code SDK trace into numbered compact steps."""
+    steps = parse_claude_trace_steps(raw)
+    if not steps:
+        return ""
+    rendered = [f"[{step['index']}] {step['type']}: {step['summary']}" for step in steps]
+    text = "\n".join(rendered)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[claude trace steps truncated]..."
+    return text
 
 
 _DENIED_DATA_DIR_NAMES = {"officeqa_split", "sealqa_split"}
@@ -851,6 +1028,245 @@ def run_claude_code_exec(
     return last_response, combined
 
 
+# ── Claude Code *chat* mode (optimizer role) ────────────────────────────────
+# The functions above run Claude Code as the *target* exec backend: they embed
+# the target preamble, force the ANSWER_SCHEMA structured output, and read from
+# a prepared workspace.  When Claude Code is instead selected as the optimizer
+# backend (claude_code_exec), reflection calls need a plain-text model call with
+# the analyst's own system prompt and no tooling — mirroring claude_backend's
+# chat path but driven through the same Claude Code CLI/SDK as the target.
+
+
+def _claude_chat_text_from_messages(messages: list[Any]) -> str:
+    """Extract the final assistant text from SDK chat-mode messages.
+
+    With ``output_format={"type": "text"}`` the SDK ends with a result message
+    whose ``result`` holds the final text; fall back to the last text block of
+    the final assistant message.
+    """
+    for msg in reversed(messages):
+        result = getattr(msg, "result", None)
+        if isinstance(result, str) and result.strip():
+            return result
+        content = getattr(msg, "content", None)
+        if content is None and isinstance(msg, dict):
+            content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                return text
+    return ""
+
+
+def _claude_chat_usage_from_event(event: Any) -> dict[str, int]:
+    """Convert an SDK/CLI result usage payload into the shared usage shape."""
+    usage = getattr(event, "usage", {}) if not isinstance(event, dict) else (event or {}).get("usage", {})
+    if isinstance(usage, dict):
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+    else:
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    return {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def _run_claude_code_sdk_chat_exec(
+    *,
+    system: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    schema: dict[str, Any] | None = None,
+    effort: str | None = None,
+) -> tuple[str, dict]:
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+    async def _query() -> tuple[str, dict]:
+        # Optimizer chat call: no workspace, no tools, optional schema.
+        with tempfile.TemporaryDirectory(prefix="skillopt_claude_code_chat_") as tmp:
+            system_prompt: dict[str, Any] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": system or "",
+            }
+            kwargs: dict[str, Any] = {
+                "system_prompt": system_prompt,
+                "output_format": (
+                    {"type": "json_schema", "schema": schema}
+                    if schema is not None
+                    else {"type": "text"}
+                ),
+                "tools": [],
+                "cwd": tmp,
+                "permission_mode": "bypassPermissions",
+            }
+            config = get_claude_code_exec_config()
+            effort_value = _claude_effort(effort if effort is not None else config.get("effort"))
+            if effort_value:
+                kwargs["effort"] = effort_value
+            max_thinking_tokens = int(config.get("max_thinking_tokens", 0) or 0)
+            if max_thinking_tokens > 0:
+                kwargs["max_thinking_tokens"] = max_thinking_tokens
+            options = ClaudeAgentOptions(**kwargs)
+            if model:
+                options.model = model.split("/", 1)[1] if model.startswith("anthropic/") else model
+
+            messages = []
+            async with ClaudeSDKClient(options) as client:
+                await client.query(prompt)
+                messages = [msg async for msg in client.receive_response()]
+        last = messages[-1] if messages else None
+        if schema is not None:
+            payload = _extract_claude_structured_output(messages)
+            text = _json_dumps(payload) if isinstance(payload, dict) else ""
+            if not text:
+                result = getattr(last, "result", None)
+                if isinstance(result, str) and result.strip():
+                    text = result
+        else:
+            text = _claude_chat_text_from_messages(messages)
+        usage_info = _claude_chat_usage_from_event(last)
+        return text, usage_info
+
+    return _run_async(asyncio.wait_for(_query(), timeout=timeout))
+
+
+def _run_claude_code_cli_chat_exec(
+    *,
+    system: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    schema: dict[str, Any] | None = None,
+    effort: str | None = None,
+) -> tuple[str, dict]:
+    config = get_claude_code_exec_config()
+    cmd = [
+        str(config["path"]),
+        "-p",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    if schema is not None:
+        cmd.extend(["--json-schema", json.dumps(schema, ensure_ascii=False)])
+    if config.get("profile"):
+        cmd.extend(["--settings", '{"env":{"CLAUDE_CODE_USE_BEDROCK":"0"}}'])
+        cmd.extend(["--append-system-prompt", f"Profile: {config['profile']}"])
+    effort_value = _claude_effort(effort if effort is not None else config.get("effort"))
+    if effort_value:
+        cmd.extend(["--effort", effort_value])
+
+    with tempfile.TemporaryDirectory(prefix="skillopt_claude_code_chat_") as tmp:
+        # System prompt via file, not argv, to avoid the Windows argv cap.
+        system_path = os.path.join(tmp, "system_prompt.txt")
+        with open(system_path, "w", encoding="utf-8") as system_fh:
+            system_fh.write(system or "")
+        cmd.extend(["--append-system-prompt-file", system_path])
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout or 300,
+            cwd=tmp,
+        )
+
+    stderr_text = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        raise RuntimeError(stderr_text or f"Claude Code CLI exited with code {proc.returncode}")
+    stream = []
+    for raw_line in (proc.stdout or "").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            stream.append(json.loads(raw_line))
+        except json.JSONDecodeError:
+            continue
+    result_event = None
+    for event in reversed(stream):
+        if event.get("type") == "result":
+            result_event = event
+            break
+    if result_event is None:
+        raise RuntimeError("Claude Code CLI did not return a result event.")
+    text = str(result_event.get("result") or result_event.get("content") or "")
+    usage_info = _claude_chat_usage_from_event(result_event)
+    return text, usage_info
+
+
+def run_claude_code_chat(
+    *,
+    system: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    schema: dict[str, Any] | None = None,
+    effort: str | None = None,
+) -> tuple[str, dict]:
+    """Run Claude Code as a plain chat model (optimizer role).
+
+    ``effort`` overrides the configured ``claude_code_exec_effort``; when ``None``
+    the config value (default "medium") is used, matching the target-exec path.
+    """
+    config = get_claude_code_exec_config()
+    mode = _sdk_mode(config.get("use_sdk"))
+    retries = int(config.get("empty_response_retries", 0) or 0)
+    last_text = ""
+    last_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    for _attempt in range(retries + 1):
+        if mode != "cli":
+            try:
+                text, usage_info = _run_claude_code_sdk_chat_exec(
+                    system=system,
+                    prompt=prompt,
+                    model=model,
+                    timeout=timeout,
+                    schema=schema,
+                    effort=effort,
+                )
+                last_text = text
+                last_usage = usage_info
+                if text.strip():
+                    return text, usage_info
+            except (ImportError, ModuleNotFoundError):
+                if mode == "sdk":
+                    raise
+            except Exception:  # noqa: BLE001
+                if mode == "sdk":
+                    raise
+        if mode != "sdk":
+            text, usage_info = _run_claude_code_cli_chat_exec(
+                system=system,
+                prompt=prompt,
+                model=model,
+                timeout=timeout,
+                schema=schema,
+                effort=effort,
+            )
+            last_text = text
+            last_usage = usage_info
+            if text.strip():
+                return text, usage_info
+
+    return last_text, last_usage
+
+
 def _run_codex_sdk_exec(
     *,
     work_dir: str,
@@ -930,7 +1346,6 @@ def _run_codex_cli_exec(
     images: list[str] | None = None,
     data_dirs: list[str] | None = None,
     sandbox: str | None = None,
-    full_auto: bool | None = None,
 ) -> tuple[str, str]:
     config = get_codex_exec_config()
     last_message_path = os.path.join(work_dir, "codex_last_message.txt")
@@ -948,12 +1363,15 @@ def _run_codex_cli_exec(
     reasoning_effort = str(config.get("reasoning_effort", "")).strip()
     if reasoning_effort:
         cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
-    actual_full_auto = bool(config.get("full_auto", True)) if full_auto is None else bool(full_auto)
     actual_sandbox = str(sandbox or config["sandbox"])
-    if actual_full_auto:
-        cmd.append("--full-auto")
-    else:
-        cmd.extend(["--sandbox", actual_sandbox])
+    validate_exec_sandbox(actual_sandbox)
+    cmd.extend(["--sandbox", actual_sandbox])
+
+    approval_policy = str(config.get("approval_policy", "never")).strip()
+    if approval_policy:
+        cmd.extend(["-c", f'approval_policy="{approval_policy}"'])
+    for override in build_codex_exec_cli_config_overrides(config):
+        cmd.extend(["-c", override])
     if model:
         cmd.extend(["-m", model])
     for data_dir in data_dirs or []:
@@ -1013,6 +1431,13 @@ def run_codex_exec(
     sandbox: str | None = None,
     full_auto: bool | None = None,
 ) -> tuple[str, str]:
+    if full_auto is not None:
+        warnings.warn(
+            "full_auto is deprecated and ignored; configure sandbox and "
+            "approval_policy explicitly instead",
+            FutureWarning,
+            stacklevel=2,
+        )
     config = get_codex_exec_config()
     mode = _sdk_mode(config.get("use_sdk"))
     retries = int(config.get("empty_response_retries", 0) or 0)
@@ -1057,7 +1482,6 @@ def run_codex_exec(
                 images=images,
                 data_dirs=data_dirs,
                 sandbox=sandbox,
-                full_auto=full_auto,
             )
             all_raw.append(f"===== CODEX CLI ATTEMPT {attempt + 1} =====\n{raw}")
             last_response = response
@@ -1090,8 +1514,115 @@ _CURSOR_SECRET_TRACE_FIELDS = {
 }
 
 
+# ``"token": "..."`` / ``"accessToken": {...}`` quoted JSON pairs, matched in
+# arbitrary (possibly non-JSON) text. Value may be a string, number, bool, or a
+# nested object/array literal quoted as a unit — we redact the whole payload.
+# Applied FIRST inside ``_redact_cursor_error``: the unquoted keyword regex below
+# stops at the first whitespace, so ``"token": "a b c"`` would otherwise leak
+# ``b c"``. Capturing the whole quoted payload up front fixes that, and since
+# ``_redact_cursor_error`` is the single shared string redactor, one change
+# covers the copilot fallback, the cursor stderr paths, and string leaves.
+# ponytail: the object branch is single-level only; deep-nested values under a
+# secret key in non-JSON text are not stripped (valid-JSON lines already go
+# through the structural walker). Add an unbounded nest parser if that ever
+# appears in real stderr.
+_COPILOT_SECRET_KEY_SUFFIXES = (
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+    "token",
+    "password",
+    "passwd",
+    "clientsecret",
+    "secret",
+    "secretkey",
+    "secretaccesskey",
+    "sharedaccesskey",
+    "privatekey",
+    "accountkey",
+    "cookie",
+    "setcookie",
+)
+_COPILOT_SECRET_KEY_EXACT = {"pwd", "sig", "authorization", "bearer"}
+
+def _is_copilot_secret_key(field: str) -> bool:
+    """The single mapping-aware secret-key policy for the Copilot path.
+
+    Uses endswith on the compacted key (mirroring ``_is_secret_mapping_key``), so
+    ``token`` / ``api_key`` / ``refreshToken`` / ``bearer`` / ``cookie`` are
+    redacted, but ``token_count`` / ``token_budget`` / ``secret_version``
+    diagnostics are preserved.
+    """
+    compact = re.sub(r"[^a-z0-9]", "", (field or "").casefold())
+    return compact in _COPILOT_SECRET_KEY_EXACT or compact.endswith(_COPILOT_SECRET_KEY_SUFFIXES)
+
+
+def _find_json_end(text: str, start: int) -> int | None:
+    """Bracket-match a JSON object/array starting at ``start`` (unbounded nesting).
+
+    String-aware (handles quotes and escapes), so a ``{`` inside a string value
+    does not confuse the matching.
+    """
+    open_ch = text[start]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    escaped = False
+    for k in range(start, len(text)):
+        ch = text[k]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return k
+    return None
+
+
+def _redact_embedded_json(text: str) -> str:
+    """Structurally redact JSON objects/arrays embedded in plain text.
+
+    Finds balanced JSON fragments (unbounded nesting, string-aware) and walks
+    each with the mapping-aware redactor, so deeply nested or pretty-printed
+    JSON embedded in a non-JSON line no longer leaks. Non-JSON text is preserved.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "{[":
+            end = _find_json_end(text, i)
+            if end is not None:
+                frag = text[i:end + 1]
+                try:
+                    obj = json.loads(frag)
+                except (ValueError, TypeError):
+                    out.append(ch)
+                    i += 1
+                    continue
+                out.append(json.dumps(_redact_copilot_json(obj), ensure_ascii=False))
+                i = end + 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _redact_cursor_error(value: str) -> str:
-    text = _CURSOR_SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", value or "")
+    text = value or ""
+    text = _redact_embedded_json(text)
+    text = _CURSOR_SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", text)
     return _CURSOR_SECRET_TOKEN.sub("[REDACTED]", text)
 
 
@@ -1114,6 +1645,42 @@ def _sanitize_cursor_json(value: Any, *, field: str = "") -> Any:
     if isinstance(value, str):
         return _redact_cursor_error(value)
     return value
+
+
+def _redact_copilot_json(value: Any, *, field: str = "") -> Any:
+    """Mapping-key-aware redaction for Copilot JSONL.
+
+    Unlike the cursor trace sanitizer, this does NOT omit ``content``/``prompt``
+    (those are the CLI output we want to keep debuggable); it redacts by secret
+    field name and applies the string-level redactor to remaining string leaves.
+    Uses the SAME key policy as the embedded-JSON fallback so valid JSON and
+    non-JSON fragments agree on what a secret field is.
+    """
+    if _is_copilot_secret_key(field):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_copilot_json(item, field=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_copilot_json(item) for item in value]
+    if isinstance(value, str):
+        return _redact_cursor_error(value)
+    return value
+
+
+def _redact_copilot_trace(raw: str | bytes) -> str:
+    """Sanitize Copilot JSONL output (mapping-key aware, unbounded nesting).
+
+    The whole text is scanned for JSON objects/arrays (single-line, multiple
+    fragments, or pretty-printed / deeply nested) and each is walked with the
+    mapping-aware redactor; remaining non-JSON text gets string-level redaction
+    for ``key=value`` and token patterns. This replaces the old line-by-line
+    regex, which only handled single-level object values.
+    """
+    text = _cursor_process_text(raw)
+    return _redact_cursor_error(text)
 
 
 def _cursor_process_text(value: str | bytes) -> str:
@@ -1304,6 +1871,109 @@ def run_cursor_exec(
     raise RuntimeError(last_error)
 
 
+def run_copilot_exec(
+    *,
+    work_dir: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    images: list[str] | None = None,
+    data_dirs: list[str] | None = None,
+    allow_file_edits: bool = False,
+) -> tuple[str, str]:
+    """Run the GitHub Copilot CLI headlessly as a benchmark target.
+
+    Uses ``copilot -p <prompt> --output-format json`` and parses the emitted
+    JSONL event stream, concatenating ``assistant.message`` content. The plain
+    text / ``--silent`` modes do not reliably stream the response to stdout on
+    every platform, so JSONL is used for robust capture.
+    """
+    config = get_copilot_exec_config()
+    retries = int(config.get("empty_response_retries", 0) or 0)
+    add_dirs = _validated_add_dirs(work_dir, data_dirs, images)[1:]
+    all_raw: list[str] = []
+    last_error = "Copilot CLI returned no response"
+    allow_all_tools = str(config.get("allow_all_tools", "0")) == "1"
+
+    for attempt in range(retries + 1):
+        attempt_prompt = _exec_prompt(
+            _retry_prompt(prompt, attempt),
+            allow_file_edits=allow_file_edits,
+        )
+        cmd = [
+            str(config["path"]),
+            "-p",
+            attempt_prompt,
+            "--output-format",
+            "json",
+            "--stream",
+            "off",
+            "--no-color",
+            "--log-level",
+            "none",
+            "-C",
+            work_dir,
+            "--disable-builtin-mcps",
+            "--no-custom-instructions",
+        ]
+        # Read-only rollouts keep the CLI's approval gate; only opt in to
+        # unattended tool use when the caller explicitly allows file edits and
+        # the operator has enabled it.
+        if allow_file_edits and allow_all_tools:
+            cmd.append("--allow-all-tools")
+        if model:
+            cmd.extend(["--model", model])
+        for path in add_dirs:
+            cmd.extend(["--add-dir", path])
+
+        home = str(config.get("home") or "")
+        env = build_copilot_subprocess_env(home)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            # Nothing to capture here: all_raw is local and this path re-raises,
+            # and TimeoutExpired already carries .stdout/.stderr for the caller.
+            raise
+        except OSError as exc:
+            raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        safe_raw = _redact_copilot_trace(stdout)
+        if stderr:
+            safe_stderr = _redact_copilot_trace(stderr)
+            safe_raw = f"{safe_raw}\n[stderr]\n{safe_stderr}" if safe_raw else f"[stderr]\n{safe_stderr}"
+        all_raw.append(f"===== COPILOT CLI ATTEMPT {attempt + 1} =====\n{safe_raw}")
+        combined = "\n\n".join(all_raw)
+
+        if proc.returncode != 0:
+            detail = _redact_copilot_trace((stderr or stdout).strip())[:4000]
+            raise RuntimeError(
+                f"Copilot CLI failed with exit code {proc.returncode}: {detail}"
+            )
+
+        response = parse_copilot_jsonl(stdout)
+        if response:
+            return response, combined
+
+    combined = "\n\n".join(all_raw)
+    # Without this the caller gets a bare "returned no response" and no CLI
+    # output at all, since copilot_exec persists no artifacts; include a
+    # bounded tail so an empty/invalid JSONL stream is debuggable.
+    detail = combined.strip()[-4000:]
+    raise RuntimeError(f"{last_error}\n{detail}" if detail else last_error)
+
+
 def run_target_exec(
     *,
     work_dir: str,
@@ -1351,6 +2021,16 @@ def run_target_exec(
             images=images,
             data_dirs=data_dirs,
             sandbox=sandbox,
+            allow_file_edits=allow_file_edits,
+        )
+    if backend == "copilot_exec":
+        return run_copilot_exec(
+            work_dir=work_dir,
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            images=images,
+            data_dirs=data_dirs,
             allow_file_edits=allow_file_edits,
         )
     raise ValueError(f"Unsupported exec backend: {backend}")

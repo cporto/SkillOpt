@@ -60,8 +60,11 @@ what the optimizer writes, add `--preferences "<your house rules>"`.
    the score, gate decision, and edits from stdout (or request `--json` when
    machine-readable output is useful).
 4. **For `run` that produced an accepted proposal:** inspect whether stdout says
-   it was auto-adopted. If not, tell the user nothing live changed and offer
-   `/skillopt-sleep adopt`; if it was, report the updated paths explicitly.
+   it was auto-adopted. If not, tell the user nothing live changed, run or cite
+   `status`, and offer the exact reviewed mode: `adopt --legacy`, repeatable
+   `adopt --skill NAME`, or `adopt --all-skills`. Never imply that bare adopt
+   means “adopt everything.” If it was auto-adopted, report the updated paths
+   and any still-pending fan-out names explicitly.
 5. **For `adopt`:** confirm which live files were updated and that backups were
    written under the staging dir's `backup/`.
 6. **Never** edit `CLAUDE.md` or `SKILL.md` yourself — let the engine's explicit

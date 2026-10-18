@@ -10,15 +10,14 @@ model:
   reasoning_effort: medium
   rewrite_reasoning_effort: ""
   rewrite_max_completion_tokens: 64000
-  codex_exec_path: codex
-  codex_exec_sandbox: workspace-write
+  codex_exec_path: ""       # blank preserves CODEX_EXEC_PATH or the built-in default
+  codex_exec_sandbox: ""    # blank preserves CODEX_EXEC_SANDBOX or workspace-write
   codex_exec_profile: ""
-  codex_exec_full_auto: false
-  codex_exec_reasoning_effort: none
-  codex_exec_use_sdk: auto
-  codex_exec_network_access: false
-  codex_exec_web_search: false
-  codex_exec_approval_policy: never
+  codex_exec_reasoning_effort: ""
+  codex_exec_use_sdk: null
+  codex_exec_network_access: null
+  codex_exec_web_search: null
+  codex_exec_approval_policy: ""
   claude_code_exec_path: claude
   claude_code_exec_profile: ""
   claude_code_exec_use_sdk: auto
@@ -26,7 +25,17 @@ model:
   claude_code_exec_max_thinking_tokens: 16384
   cursor_exec_path: ""       # blank uses CURSOR_EXEC_PATH or cursor-agent
   cursor_exec_sandbox: ""    # blank uses CURSOR_EXEC_SANDBOX or enabled
+  # GitHub Copilot CLI. `--backend copilot` selects copilot_chat for BOTH roles,
+  # using CLI authentication rather than a separate provider API key.
+  copilot_exec_path: ""              # blank uses COPILOT_EXEC_PATH or copilot
+  copilot_exec_home: ""              # blank leaves COPILOT_HOME untouched
+  # null preserves COPILOT_EXEC_ALLOW_ALL_TOOLS (default off); copilot_exec only
+  copilot_exec_allow_all_tools: null  # required for file-edit rollouts
+  copilot_chat_optimizer_model: ""   # blank lets the CLI pick its default model
+  copilot_chat_target_model: ""
+  copilot_chat_timeout: null         # preserves COPILOT_CHAT_TIMEOUT or the built-in default
   codex_trace_to_optimizer: true
+  claude_trace_to_optimizer: true
   azure_openai_endpoint: ""           # e.g. "https://your-resource.openai.azure.com/"
   azure_openai_api_version: "2024-12-01-preview"
   azure_openai_api_key: ""       # Fill locally if you do not export AZURE_OPENAI_API_KEY
@@ -46,10 +55,19 @@ model:
   target_azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
   target_azure_openai_managed_identity_client_id: ""
 
+  # Qwen backend settings (qwen_chat roles). `chat_template_kwargs` is a
+  # vLLM/SGLang extension that OpenAI/Azure reject, so the wire policy is
+  # explicit: server_default omits the key (safe default), enabled/disabled
+  # send it. Pin "disabled" to reproduce the published non-thinking numbers.
+  qwen_chat_thinking_mode: ""            # server_default (default) | enabled | disabled
+  optimizer_qwen_chat_thinking_mode: ""  # per-role override
+  target_qwen_chat_thinking_mode: ""     # per-role override
+
   # MiniMax backend settings (minimax_chat target)
-  minimax_base_url: ""          # https://api.minimax.io/v1 if blank
+  minimax_region: ""            # global_en (default) or cn_zh; selects the base URL
+  minimax_base_url: ""          # region base URL if blank
   minimax_api_key: ""
-  minimax_model: "MiniMax-M2.7"
+  minimax_model: "MiniMax-M3"
   minimax_temperature: "0.7"
   minimax_max_tokens: "8000"
   minimax_enable_thinking: "false"
@@ -69,7 +87,6 @@ gradient:
   minibatch_size: 8
   merge_batch_size: 8
   analyst_workers: 16
-  max_analyst_rounds: 3
   failure_only: false
 
 optimizer:

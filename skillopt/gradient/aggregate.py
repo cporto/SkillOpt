@@ -7,6 +7,7 @@ Failure-driven patches take priority over success-driven ones.
 from __future__ import annotations
 
 import json
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from skillopt.model import chat_optimizer
@@ -21,7 +22,6 @@ from skillopt.optimizer.update_modes import (
 )
 from skillopt.prompts import load_prompt
 from skillopt.utils import extract_json
-
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -52,12 +52,21 @@ def _merge_batch(
         )
         merged = extract_json(response)
         key = payload_key(update_mode)
-        if merged and key in merged:
-            for e in merged.get(key, []):
+        items = merged.get(key) if isinstance(merged, dict) else None
+        if isinstance(items, list) and all(isinstance(e, dict) for e in items):
+            for e in items:
                 e["merge_level"] = level
             return merged
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:  # noqa: BLE001 — optimizer/provider failures must fall back
+        warnings.warn(
+            "Optimizer call or parsing failed during batch merge; using fallback",
+            stacklevel=2,
+        )
+    else:
+        warnings.warn(
+            "Optimizer returned unusable output during batch merge; using fallback",
+            stacklevel=2,
+        )
     # Fallback: concatenate all edits
     all_edits = []
     for p in patches:
@@ -81,12 +90,16 @@ def _hierarchical_merge(
     """Hierarchically merge N patches using the given system prompt.
 
     Same-level batches are executed in PARALLEL via ThreadPoolExecutor.
+    batch_size values < 2 are clamped to 2 so each merge level shrinks
+    (values < 2 cannot make progress). Trainer-level config validation
+    separately enforces merge_batch_size >= 2; this clamp is defense-in-depth.
     """
     if not patches:
         return {"reasoning": "no patches", payload_key(update_mode): []}
     if len(patches) == 1:
         return patches[0]
 
+    batch_size = max(2, batch_size)
     current = list(patches)
     level = 0
     while len(current) > 1:
@@ -237,15 +250,24 @@ def merge_patches(
         )
         final = extract_json(response)
         key = payload_key(update_mode)
-        if final and key in final:
+        items = final.get(key) if isinstance(final, dict) else None
+        if isinstance(items, list) and all(isinstance(e, dict) for e in items):
             if verbose:
                 print(
                     f"    [aggregate final] "
-                    f"{len(f_edits)}+{len(s_edits)} → {len(final[key])} {payload_label(update_mode)}"
+                    f"{len(f_edits)}+{len(s_edits)} → {len(items)} {payload_label(update_mode)}"
                 )
             return final
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:  # noqa: BLE001 — optimizer/provider failures must fall back
+        warnings.warn(
+            "Optimizer call or parsing failed during final merge; using fallback",
+            stacklevel=2,
+        )
+    else:
+        warnings.warn(
+            "Optimizer returned unusable output during final merge; using fallback",
+            stacklevel=2,
+        )
 
     return {
         "reasoning": "fallback: failure first, then success",

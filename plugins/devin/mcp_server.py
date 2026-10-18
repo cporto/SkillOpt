@@ -10,8 +10,8 @@ Before each data-reading action this server runs `harvest_devin.py` to convert
 locally available Devin data (ATIF-v1.7 transcripts, agentmemory memories, and
 .devin skill files) into the Claude Code-compatible JSONL the engine consumes,
 writing it under SKILLOPT_DEVIN_CLAUDE_HOME and pointing the engine there with
-`--claude-home`. After `sleep_adopt` the evolved skill is synced back into the
-workspace's `.devin/skills/`.
+`--claude-home`. Adoption is performed only by the core engine against the
+requested target; this adapter never performs a second copy or sync afterward.
 
 Tools: sleep_status, sleep_dry_run, sleep_run, sleep_adopt, sleep_harvest,
 sleep_schedule, sleep_unschedule. Each shells out to
@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
+from typing import NamedTuple
 
 # expanduser wraps the whole value so a "~/..." env var is expanded too (not
 # just a default) — otherwise a literal ~ dir gets created.
@@ -36,7 +36,6 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 CLAUDE_HOME = os.path.expanduser(
     os.environ.get("SKILLOPT_DEVIN_CLAUDE_HOME", "~/.skillopt-sleep-devin")
 )
-MANAGED_SKILL_NAME = os.environ.get("SKILLOPT_MANAGED_SKILL", "skillopt-sleep-learned")
 PROTOCOL_VERSION = "2024-11-05"
 
 TOOLS = [
@@ -47,7 +46,7 @@ TOOLS = [
     {"name": "sleep_run", "action": "run",
      "description": "Run a full sleep cycle; stages a reviewed proposal. Nothing live changes until adopt."},
     {"name": "sleep_adopt", "action": "adopt",
-     "description": "Apply the latest staged proposal to the managed SKILL.md and sync it into .devin/skills/."},
+     "description": "Apply a reviewed legacy or per-skill staged proposal (backs up first)."},
     {"name": "sleep_harvest", "action": "harvest",
      "description": "Debug: list the recurring tasks mined from recent Devin sessions."},
     {"name": "sleep_schedule", "action": "schedule",
@@ -74,23 +73,41 @@ _TOOL_SCHEMA = {
                        "description": "Path to reviewed TaskRecord JSON (skips harvest)."},
         "target_skill_path": {"type": "string",
                               "description": "Explicit SKILL.md path to evolve/stage/adopt."},
+        "staging": {
+            "type": "string",
+            "description": "For sleep_adopt, use this exact staging directory instead of the latest night.",
+        },
+        "skills": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": True,
+            "description": "For sleep_adopt, adopt only these staged per-skill proposals.",
+        },
+        "all_skills": {
+            "type": "boolean",
+            "description": "For sleep_adopt, adopt every staged per-skill proposal.",
+        },
+        "legacy": {
+            "type": "boolean",
+            "description": "For sleep_adopt, adopt only the legacy managed SKILL.md/CLAUDE.md pair.",
+        },
         "progress": {"type": "boolean",
                      "description": "Print phase progress to stderr."},
-        "max_sessions": {"type": "integer",
+        "max_sessions": {"type": "integer", "minimum": 0, "maximum": 1_000_000,
                          "description": "Cap harvested sessions per run."},
-        "max_tasks": {"type": "integer",
+        "max_tasks": {"type": "integer", "minimum": 0, "maximum": 1_000_000,
                       "description": "Cap mined tasks per run."},
-        "lookback_hours": {"type": "integer",
+        "lookback_hours": {"type": "integer", "minimum": 0, "maximum": 1_000_000,
                            "description": "Harvest window in hours (default: 72)."},
         "auto_adopt": {"type": "boolean",
                        "description": "Auto-adopt if gate passes (default: false)."},
         "json": {"type": "boolean",
                  "description": "Return machine-readable JSON output."},
-        "edit_budget": {"type": "integer",
+        "edit_budget": {"type": "integer", "minimum": 0, "maximum": 1_000_000,
                         "description": "Max bounded edits per night (default: 4)."},
-        "hour": {"type": "integer",
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23,
                  "description": "Hour for schedule (0-23, default: 3)."},
-        "minute": {"type": "integer",
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59,
                    "description": "Minute for schedule (0-59, default: 17)."},
     },
     "additionalProperties": False,
@@ -99,8 +116,93 @@ _TOOL_SCHEMA = {
 # actions that read harvested Devin data (schedule/unschedule/adopt don't)
 _HARVEST_ACTIONS = {"status", "dry-run", "run", "harvest"}
 
+_STRING_ARGS = {
+    "project", "backend", "scope", "source", "model", "tasks_file",
+    "target_skill_path", "staging",
+}
+_BOOLEAN_ARGS = {"all_skills", "legacy", "progress", "auto_adopt", "json"}
+_INTEGER_BOUNDS = {
+    "max_sessions": (0, 1_000_000),
+    "max_tasks": (0, 1_000_000),
+    "lookback_hours": (0, 1_000_000),
+    "edit_budget": (0, 1_000_000),
+    "hour": (0, 23),
+    "minute": (0, 59),
+}
+_ADOPT_ONLY_ARGS = {"staging", "skills", "all_skills", "legacy"}
+_SCHEDULE_ONLY_ARGS = {"hour", "minute"}
 
-def _run_harvest() -> str:
+
+class EngineResult(NamedTuple):
+    """One engine invocation, including status hidden by the old text-only API."""
+
+    text: str
+    returncode: int
+    diagnostics: str = ""
+
+
+def _validate_text(key: str, value: object) -> None:
+    if type(value) is not str:
+        raise ValueError(f"{key} must be a string")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError(f"{key} must not contain control characters")
+
+
+def _validate_tool_arguments(action: str, args: object) -> dict:
+    """Validate MCP input at runtime; clients are not trusted to enforce schema."""
+    if action not in {tool["action"] for tool in TOOLS}:
+        raise ValueError(f"unknown action: {action}")
+    if type(args) is not dict:
+        raise ValueError("arguments must be an object")
+    unknown = sorted(set(args) - set(_TOOL_SCHEMA["properties"]))
+    if unknown:
+        raise ValueError(f"unknown argument(s): {', '.join(unknown)}")
+    if action != "adopt" and set(args) & _ADOPT_ONLY_ARGS:
+        raise ValueError("staging/skills/all_skills/legacy are valid only for sleep_adopt")
+    if action != "schedule" and set(args) & _SCHEDULE_ONLY_ARGS:
+        raise ValueError("hour/minute are valid only for sleep_schedule")
+
+    for key in _STRING_ARGS & set(args):
+        _validate_text(key, args[key])
+    for key in _BOOLEAN_ARGS & set(args):
+        if type(args[key]) is not bool:
+            raise ValueError(f"{key} must be a boolean")
+    for key, (minimum, maximum) in _INTEGER_BOUNDS.items():
+        if key not in args:
+            continue
+        value = args[key]
+        if type(value) is not int:
+            raise ValueError(f"{key} must be an integer")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+
+    for key in ("backend", "scope", "source"):
+        if key in args and args[key] not in _TOOL_SCHEMA["properties"][key]["enum"]:
+            raise ValueError(f"unsupported {key}: {args[key]!r}")
+
+    skills = args.get("skills", [])
+    if type(skills) is not list:
+        raise ValueError("skills must be an array of strings")
+    normalized = []
+    for skill in skills:
+        _validate_text("every skills entry", skill)
+        name = skill.strip()
+        if not name:
+            raise ValueError("every skills entry must be non-empty")
+        normalized.append(name)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("skills entries must be unique")
+
+    modes = sum((bool(normalized), args.get("all_skills") is True, args.get("legacy") is True))
+    if modes > 1:
+        raise ValueError("choose at most one of skills, all_skills, or legacy")
+    validated = dict(args)
+    if "skills" in validated:
+        validated["skills"] = normalized
+    return validated
+
+
+def _run_harvest() -> EngineResult:
     """Convert local Devin data into the JSONL the engine reads, under CLAUDE_HOME."""
     harvester = os.path.join(PLUGIN_DIR, "harvest_devin.py")
     env = dict(os.environ)
@@ -112,28 +214,37 @@ def _run_harvest() -> str:
         )
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
-        return out + (("\n[harvest stderr]\n" + err) if err else "")
+        return EngineResult(out, proc.returncode, err)
     except Exception as exc:
-        return f"[harvest_devin] warning: {exc}"
+        return EngineResult(f"[error] failed to run Devin harvest: {exc}", 1)
 
 
-def _sync_skill(project: str) -> str:
-    """After adopt, copy the evolved skill into the workspace's .devin/skills/."""
-    src = os.path.join(CLAUDE_HOME, "skills", MANAGED_SKILL_NAME, "SKILL.md")
-    if not (os.path.isfile(src) and project and os.path.isdir(project)):
-        return ""
-    dot_root = os.path.join(project, ".devin")
-    if not os.path.isdir(dot_root):
-        return ""
-    dst_dir = os.path.join(dot_root, "skills", MANAGED_SKILL_NAME)
-    os.makedirs(dst_dir, exist_ok=True)
-    dst = os.path.join(dst_dir, "SKILL.md")
-    shutil.copy2(src, dst)
-    return f"\n[sleep] synced evolved skill → {dst}"
+def _append_adopt_args(cmd: list[str], args: dict) -> None:
+    """Append selection flags as argv tokens; never interpolate skill names."""
+    staging = args.get("staging")
+    if staging:
+        cmd += ["--staging", str(staging)]
+
+    skills = args.get("skills") or []
+    for skill in skills:
+        if skill.startswith("-"):
+            cmd.append(f"--skill={skill}")
+        else:
+            cmd += ["--skill", skill]
+    if args.get("all_skills"):
+        cmd.append("--all-skills")
+    if args.get("legacy"):
+        cmd.append("--legacy")
 
 
-def _run_engine(action: str, args: dict) -> str:
-    harvest_out = _run_harvest() if action in _HARVEST_ACTIONS else ""
+def _run_engine(action: str, args: object) -> EngineResult:
+    args = _validate_tool_arguments(action, args)
+    harvest = _run_harvest() if action in _HARVEST_ACTIONS else EngineResult("", 0)
+    if harvest.returncode != 0:
+        text = harvest.text
+        if harvest.diagnostics:
+            text += ("\n[harvest stderr]\n" if text else "") + harvest.diagnostics
+        return EngineResult(text, harvest.returncode)
 
     py = sys.executable or "python3"
     cmd = [py, "-m", "skillopt_sleep", action, "--claude-home", CLAUDE_HOME]
@@ -165,6 +276,8 @@ def _run_engine(action: str, args: dict) -> str:
     ]:
         if args.get(key):
             cmd.append(flag)
+    if action == "adopt":
+        _append_adopt_args(cmd, args)
 
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
@@ -172,15 +285,19 @@ def _run_engine(action: str, args: dict) -> str:
         proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True,
                               text=True, timeout=3600, env=env)
     except Exception as e:
-        return f"[harvest]\n{harvest_out}\n[error] failed to run engine: {e}"
+        return EngineResult(f"[error] failed to run engine: {e}", 1, harvest.text)
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
-    result = (f"[harvest]\n{harvest_out}\n\n" if harvest_out else "") + f"[engine]\n{out}"
+    diagnostics = "\n".join(part for part in (harvest.text, harvest.diagnostics, err) if part)
+    if args.get("json"):
+        text = out if out or proc.returncode in {0, 3} else err
+        return EngineResult(text, proc.returncode, diagnostics)
+    result = (f"[harvest]\n{harvest.text}\n\n" if harvest.text else "") + f"[engine]\n{out}"
+    if harvest.diagnostics:
+        result += f"\n[harvest stderr]\n{harvest.diagnostics}"
     if err:
         result += f"\n[stderr]\n{err}"
-    if action == "adopt":
-        result += _sync_skill(args.get("project") or os.getcwd())
-    return result
+    return EngineResult(result, proc.returncode)
 
 
 def _result(id_, result):
@@ -191,9 +308,60 @@ def _error(id_, code, message):
     return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
 
 
-def handle(req: dict):
+def _validate_request(req: object) -> tuple[str, object, dict]:
+    if type(req) is not dict:
+        raise ValueError("request must be a JSON object")
+    unknown = sorted(set(req) - {"jsonrpc", "id", "method", "params"})
+    if unknown:
+        raise ValueError(f"unknown request member(s): {', '.join(unknown)}")
+    if req.get("jsonrpc") != "2.0":
+        raise ValueError("jsonrpc must be '2.0'")
     method = req.get("method")
-    id_ = req.get("id")
+    if type(method) is not str or not method:
+        raise ValueError("method must be a non-empty string")
+    params = req.get("params", {})
+    if type(params) is not dict:
+        raise ValueError("params must be an object")
+    request_id = req.get("id")
+    if "id" in req and request_id is not None and type(request_id) not in {str, int}:
+        raise ValueError("id must be a string, integer, or null")
+    return method, request_id, params
+
+
+def _validate_method_params(method: str, params: dict) -> None:
+    allowed_by_method = {
+        "initialize": {"protocolVersion", "capabilities", "clientInfo", "_meta"},
+        "notifications/initialized": {"_meta"},
+        "initialized": {"_meta"},
+        "tools/list": {"cursor", "_meta"},
+        "tools/call": {"name", "arguments", "_meta"},
+        "ping": {"_meta"},
+    }
+    allowed = allowed_by_method.get(method)
+    if allowed is None:
+        return
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        raise ValueError(f"unknown params member(s): {', '.join(unknown)}")
+    for key in ("capabilities", "clientInfo", "_meta"):
+        if key in params and type(params[key]) is not dict:
+            raise ValueError(f"{key} must be an object")
+    for key in ("protocolVersion", "cursor"):
+        if key in params and type(params[key]) is not str:
+            raise ValueError(f"{key} must be a string")
+
+
+def handle(req: object):
+    try:
+        method, id_, params = _validate_request(req)
+    except ValueError as exc:
+        candidate = req.get("id") if type(req) is dict else None
+        request_id = candidate if candidate is None or type(candidate) in {str, int} else None
+        return _error(request_id, -32600, f"invalid request: {exc}")
+    try:
+        _validate_method_params(method, params)
+    except ValueError as exc:
+        return _error(id_, -32602, f"invalid params: {exc}")
     if method == "initialize":
         return _result(id_, {
             "protocolVersion": PROTOCOL_VERSION,
@@ -208,13 +376,34 @@ def handle(req: dict):
             for t in TOOLS
         ]})
     if method == "tools/call":
-        params = req.get("params") or {}
         name = params.get("name")
+        if type(name) is not str:
+            return _error(id_, -32602, "tool name must be a string")
         tool = _BY_NAME.get(name)
         if not tool:
             return _error(id_, -32602, f"unknown tool: {name}")
-        text = _run_engine(tool["action"], params.get("arguments") or {})
-        return _result(id_, {"content": [{"type": "text", "text": text}]})
+        arguments = params.get("arguments", {})
+        try:
+            run = _run_engine(tool["action"], arguments)
+        except ValueError as exc:
+            return _error(id_, -32602, f"invalid {name} arguments: {exc}")
+        status = "handoff_pending" if run.returncode == 3 else (
+            "ok" if run.returncode == 0 else "error"
+        )
+        structured = {"status": status, "exit_code": run.returncode}
+        if run.diagnostics:
+            structured["diagnostics"] = run.diagnostics
+        if type(arguments) is dict and arguments.get("json") is True and run.text:
+            try:
+                structured["output"] = json.loads(run.text)
+            except json.JSONDecodeError:
+                pass
+        result = {
+            "content": [{"type": "text", "text": run.text}],
+            "structuredContent": structured,
+            "isError": run.returncode not in {0, 3},
+        }
+        return _result(id_, result)
     if method == "ping":
         return _result(id_, {})
     return _error(id_, -32601, f"method not found: {method}")
@@ -227,9 +416,10 @@ def main() -> int:
             continue
         try:
             req = json.loads(line)
-        except Exception:
-            continue
-        resp = handle(req)
+        except json.JSONDecodeError:
+            resp = _error(None, -32700, "parse error")
+        else:
+            resp = handle(req)
         if resp is not None:
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()

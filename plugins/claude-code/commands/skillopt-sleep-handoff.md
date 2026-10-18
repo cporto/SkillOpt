@@ -53,8 +53,9 @@ Repeat until the engine exits 0 (done) — at most 8 rounds:
 - For `run`, if the engine prints a staging directory, `Read` its `report.md`
   and show the user: held-out baseline → candidate score, the gate decision,
   the proposed edits, and where the proposal is staged. If an accepted proposal
-  was staged, tell the user nothing live changed and offer
-  `/skillopt-sleep adopt`.
+  was staged, tell the user nothing live changed, inspect `status`, and offer
+  the exact reviewed selection: `adopt --legacy`, repeatable
+  `adopt --skill NAME`, or `adopt --all-skills`.
 - For `dry-run`, no staging directory or `report.md` is created; summarize the
   final stdout instead.
 - The engine archives `.skillopt-sleep-handoff/` on a completed real run;

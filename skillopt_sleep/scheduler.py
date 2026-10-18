@@ -5,7 +5,9 @@ runs the sleep cycle automatically, so the user doesn't have to wire it manually
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,8 +61,8 @@ def _have_schtasks() -> bool:
 
 def _win_task_name(project: str) -> str:
     project = os.path.abspath(project)
-    safe = project.replace(":\\", "_").replace("\\", "_").replace("/", "_").replace(" ", "_")
-    return f"SkillOpt-Sleep-{safe}"
+    digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:20]
+    return f"SkillOpt-Sleep-{digest}"
 
 
 def _create_win_task(task_name: str, command: str, hour: int, minute: int) -> bool:
@@ -102,26 +104,51 @@ def _list_win_tasks() -> List[str]:
 
 
 def _runner_cmd(project: str, backend: str, extra: str, python: str) -> str:
+    _validate_scheduler_text("project", project)
+    _validate_scheduler_text("python", python)
+    _validate_scheduler_text("repository", _repo_root())
+    _validate_scheduler_text("backend", backend)
+    if extra:
+        _validate_scheduler_text("extra scheduler arguments", extra)
     logdir = os.path.join(project, ".skillopt-sleep")
     log = os.path.join(logdir, "cron.log")
-    # use absolute python + -m so cron's/scheduler's minimal env still works
-    cmd = (f'"{python}" -m skillopt_sleep run --project "{project}" '
-           f'--scope invoked --backend {backend} {extra}'.rstrip())
+    args = [
+        python,
+        "-m",
+        "skillopt_sleep",
+        "run",
+        "--project",
+        project,
+        "--scope",
+        "invoked",
+        "--backend",
+        backend,
+        *shlex.split(extra),
+    ]
     if sys.platform == "win32":
-        helper_script = os.path.join(logdir, "run.cmd")
+        helper_script = os.path.join(logdir, "run.ps1")
         try:
             os.makedirs(logdir, exist_ok=True)
+            quoted = " ".join(_powershell_literal(value) for value in args[1:])
             content = (
-                "@echo off\n"
-                f'cd /d "{_repo_root()}"\n'
-                f'{cmd} >> "{log}" 2>&1\n'
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Set-Location -LiteralPath {_powershell_literal(_repo_root())}\n"
+                f"& {_powershell_literal(python)} {quoted} "
+                f"*>> {_powershell_literal(log)}\n"
             )
             with open(helper_script, "w", encoding="utf-8") as f:
                 f.write(content)
-        except Exception:
-            pass
-        return f'"{helper_script}"'
-    return f'mkdir -p "{logdir}"; cd "{_repo_root()}" && {cmd} >> "{log}" 2>&1'
+        except OSError as exc:
+            raise ValueError(f"could not create the Windows scheduler helper: {exc}") from exc
+        return (
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+            f"-File {_windows_command_quote(helper_script)}"
+        )
+    cmd = shlex.join(args)
+    return (
+        f"mkdir -p {shlex.quote(logdir)}; "
+        f"cd {shlex.quote(_repo_root())} && {cmd} >> {shlex.quote(log)} 2>&1"
+    )
 
 
 def _repo_root() -> str:
@@ -129,8 +156,31 @@ def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def _validate_scheduler_text(label: str, value: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError(f"{label} cannot contain control characters")
+
+
+def _powershell_literal(value: str) -> str:
+    """Single-quoted PowerShell data literal."""
+    _validate_scheduler_text("scheduler argument", value)
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _windows_command_quote(value: str) -> str:
+    """Quote a Windows path whose allowed characters cannot include quotes."""
+    _validate_scheduler_text("scheduler path", value)
+    if '"' in value:
+        raise ValueError("scheduler path cannot contain a double quote")
+    return f'"{value}"'
+
+
 def _project_marker(project: str) -> str:
-    return f"# project={os.path.abspath(project)}"
+    canonical = os.path.abspath(project)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"# project-sha256={digest}"
 
 
 def schedule(project: str, *, backend: str = "mock", hour: int = 3, minute: int = 17,
@@ -140,9 +190,16 @@ def schedule(project: str, *, backend: str = "mock", hour: int = 3, minute: int 
     Returns (installed, message). If the scheduler backend is unavailable, installed=False and
     the message contains instructions to add manually.
     """
+    if type(hour) is not int or not 0 <= hour <= 23:
+        return False, "hour must be an integer from 0 through 23"
+    if type(minute) is not int or not 0 <= minute <= 59:
+        return False, "minute must be an integer from 0 through 59"
     project = os.path.abspath(project)
     python = python or sys.executable or "python3"
-    runner_cmd = _runner_cmd(project, backend, extra, python)
+    try:
+        runner_cmd = _runner_cmd(project, backend, extra, python)
+    except (ValueError, OSError) as exc:
+        return False, f"Refusing unsafe scheduler configuration: {exc}"
 
     if sys.platform == "win32":
         if not _have_schtasks():
@@ -195,7 +252,7 @@ def unschedule(project: Optional[str] = None, *, all_projects: bool = False) -> 
             ok = _delete_win_task(tn)
             try:
                 logdir = os.path.join(project, ".skillopt-sleep")
-                helper = os.path.join(logdir, "run.cmd")
+                helper = os.path.join(logdir, "run.ps1")
                 if os.path.exists(helper):
                     os.remove(helper)
             except Exception:

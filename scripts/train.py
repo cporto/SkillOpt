@@ -26,9 +26,16 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# Progress output uses box-drawing and arrow characters that crash a cp1252
+# console/redirection mid-run; force UTF-8 before any of it is written.
+from skillopt.utils.console import force_utf8_stdout_stderr
+
+force_utf8_stdout_stderr()
+
 from skillopt.model.common import default_model_for_backend, normalize_backend_name
 
 _OPENAI_DEFAULT_MODEL_SENTINELS = {"gpt-5.4", "gpt-5.5"}
+_ROLE_BACKEND_DEFAULTS = (None, "", "openai_chat")
 
 
 # ── Environment registry ────────────────────────────────────────────────────
@@ -137,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     # Legacy flat CLI overrides (still work, prefer --cfg-options for new usage)
     p.add_argument("--env", type=str)
     p.add_argument("--backend", type=str,
-                   choices=["azure_openai", "codex", "codex_exec", "claude", "claude_chat", "claude_code_exec", "cursor", "cursor_exec", "qwen", "qwen_chat", "minimax", "minimax_chat"])
+                   choices=["azure_openai", "codex", "codex_exec", "claude", "claude_chat", "claude_code_exec", "cursor", "cursor_exec", "copilot", "copilot_chat", "copilot_exec", "qwen", "qwen_chat", "minimax", "minimax_chat", "openai_compatible"])
     p.add_argument("--optimizer_model", type=str)
     p.add_argument("--target_model", type=str)
     p.add_argument("--optimizer_backend", type=str)
@@ -173,28 +180,57 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--qwen_chat_timeout_seconds", type=float)
     p.add_argument("--qwen_chat_max_tokens", type=int)
     p.add_argument("--qwen_chat_enable_thinking", type=_BOOL)
+    p.add_argument("--qwen_chat_thinking_mode", type=str)
     p.add_argument("--optimizer_qwen_chat_base_url", type=str)
     p.add_argument("--optimizer_qwen_chat_api_key", type=str)
     p.add_argument("--optimizer_qwen_chat_temperature", type=float)
     p.add_argument("--optimizer_qwen_chat_timeout_seconds", type=float)
     p.add_argument("--optimizer_qwen_chat_max_tokens", type=int)
     p.add_argument("--optimizer_qwen_chat_enable_thinking", type=_BOOL)
+    p.add_argument("--optimizer_qwen_chat_thinking_mode", type=str)
     p.add_argument("--target_qwen_chat_base_url", type=str)
     p.add_argument("--target_qwen_chat_api_key", type=str)
     p.add_argument("--target_qwen_chat_temperature", type=float)
     p.add_argument("--target_qwen_chat_timeout_seconds", type=float)
     p.add_argument("--target_qwen_chat_max_tokens", type=int)
     p.add_argument("--target_qwen_chat_enable_thinking", type=_BOOL)
+    p.add_argument("--target_qwen_chat_thinking_mode", type=str)
+    p.add_argument("--minimax_region", type=str)
     p.add_argument("--minimax_base_url", type=str)
     p.add_argument("--minimax_api_key", type=str)
     p.add_argument("--minimax_model", type=str)
     p.add_argument("--minimax_temperature", type=float)
     p.add_argument("--minimax_max_tokens", type=int)
     p.add_argument("--minimax_enable_thinking", type=_BOOL)
+    p.add_argument("--openai_compatible_base_url", type=str)
+    p.add_argument("--openai_compatible_api_key", type=str)
+    p.add_argument("--openai_compatible_model", type=str)
+    p.add_argument("--openai_compatible_temperature", type=float)
+    p.add_argument("--openai_compatible_timeout_seconds", type=float)
+    p.add_argument("--openai_compatible_max_tokens", type=int)
+    p.add_argument("--optimizer_openai_compatible_base_url", type=str)
+    p.add_argument("--optimizer_openai_compatible_api_key", type=str)
+    p.add_argument("--optimizer_openai_compatible_model", type=str)
+    p.add_argument("--optimizer_openai_compatible_temperature", type=float)
+    p.add_argument("--optimizer_openai_compatible_timeout_seconds", type=float)
+    p.add_argument("--optimizer_openai_compatible_max_tokens", type=int)
+    p.add_argument("--target_openai_compatible_base_url", type=str)
+    p.add_argument("--target_openai_compatible_api_key", type=str)
+    p.add_argument("--target_openai_compatible_model", type=str)
+    p.add_argument("--target_openai_compatible_temperature", type=float)
+    p.add_argument("--target_openai_compatible_timeout_seconds", type=float)
+    p.add_argument("--target_openai_compatible_max_tokens", type=int)
     p.add_argument("--codex_exec_path", type=str)
     p.add_argument("--codex_exec_sandbox", type=str)
     p.add_argument("--codex_exec_profile", type=str)
-    p.add_argument("--codex_exec_full_auto", type=_BOOL)
+    p.add_argument(
+        "--codex_exec_full_auto",
+        type=_BOOL,
+        help=(
+            "Deprecated and ignored; use --codex_exec_sandbox and "
+            "--codex_exec_approval_policy"
+        ),
+    )
     p.add_argument("--codex_exec_reasoning_effort", type=str)
     p.add_argument("--codex_exec_use_sdk", type=str)
     p.add_argument("--codex_exec_network_access", type=_BOOL)
@@ -207,6 +243,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--claude_code_exec_max_thinking_tokens", type=int)
     p.add_argument("--cursor_exec_path", type=str)
     p.add_argument("--cursor_exec_sandbox", type=str)
+    p.add_argument("--copilot_exec_path", type=str)
+    p.add_argument("--copilot_exec_home", type=str)
+    p.add_argument("--copilot_exec_allow_all_tools", type=_BOOL)
+    p.add_argument("--copilot_chat_optimizer_model", type=str)
+    p.add_argument("--copilot_chat_target_model", type=str)
+    p.add_argument("--copilot_chat_timeout", type=int)
     p.add_argument("--codex_trace_to_optimizer", type=_BOOL)
     p.add_argument("--skill_init", type=str)
     p.add_argument("--num_epochs", type=int)
@@ -222,7 +264,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_control_mode", type=str,
                    choices=["fixed", "autonomous", "none"])
     p.add_argument("--merge_batch_size", type=int)
-    p.add_argument("--max_analyst_rounds", type=int)
+    # Retired, still accepted so existing launch scripts keep running.
+    p.add_argument("--max_analyst_rounds", type=int, help=argparse.SUPPRESS)
     p.add_argument("--sel_env_num", type=int)
     p.add_argument("--test_env_num", type=int)
     p.add_argument("--eval_test", type=_BOOL)
@@ -275,6 +318,72 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# ── Retired CLI options ──────────────────────────────────────────────────────
+
+# Still parsed so that existing launch scripts do not fail on an unrecognised
+# argument, but deliberately kept out of the config: an option here has no
+# structured path, and without the explicit skip below the mapping loop in
+# ``load_config`` would file it under ``env.<name>``.
+# Flat CLI name -> (the structured key it used to have, why it is gone).
+_RETIRED_CLI_OPTIONS: dict[str, tuple[str, str]] = {
+    "max_analyst_rounds": (
+        "gradient.max_analyst_rounds",
+        "the analyst call count follows from the rollout results, "
+        "gradient.minibatch_size and gradient.failure_only",
+    ),
+}
+
+
+def _lookup_dotted(cfg: dict, dotted: str):
+    """Value at a dotted path in *cfg*, or ``None`` if any level is missing."""
+    node: object = cfg
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _retired_option_sources(
+    args: argparse.Namespace,
+    cfg: dict,
+    structured: bool,
+    flat_name: str,
+    dotted: str,
+) -> list[str]:
+    """Every input path that still supplies a retired option.
+
+    The CLI flag is not the only way in, and it is the least dangerous one. A
+    retired key left in a YAML file is dropped in silence: ``flatten_config`` no
+    longer maps it and the trainer no longer reads it, so the run proceeds as
+    though the file had never mentioned it. That silence is what the CLI warning
+    exists to prevent, so the config file and ``--cfg-options`` get the same
+    treatment.
+    """
+    sources: list[str] = []
+    if getattr(args, flat_name, None) is not None:
+        sources.append(f"--{flat_name}")
+
+    accepted = {dotted, flat_name}
+    overrides = [
+        key.strip()
+        for key, separator, _value in (
+            str(option).partition("=")
+            for option in getattr(args, "cfg_options", None) or []
+        )
+        if separator and key.strip() in accepted
+    ]
+    sources.extend(f"--cfg-options {key}" for key in overrides)
+
+    # Only when no override named it: an override is already reported as the
+    # source and is filtered before loading so it cannot change config format.
+    if not overrides:
+        key = dotted if structured else flat_name
+        if _lookup_dotted(cfg, key) is not None:
+            sources.append("the config file")
+    return sources
+
+
 # ── Flat key → structured path mapping (for legacy CLI → structured config) ──
 
 _LEGACY_TO_STRUCTURED: dict[str, str] = {
@@ -313,24 +422,46 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
     "qwen_chat_timeout_seconds": "model.qwen_chat_timeout_seconds",
     "qwen_chat_max_tokens": "model.qwen_chat_max_tokens",
     "qwen_chat_enable_thinking": "model.qwen_chat_enable_thinking",
+    "qwen_chat_thinking_mode": "model.qwen_chat_thinking_mode",
     "optimizer_qwen_chat_base_url": "model.optimizer_qwen_chat_base_url",
     "optimizer_qwen_chat_api_key": "model.optimizer_qwen_chat_api_key",
     "optimizer_qwen_chat_temperature": "model.optimizer_qwen_chat_temperature",
     "optimizer_qwen_chat_timeout_seconds": "model.optimizer_qwen_chat_timeout_seconds",
     "optimizer_qwen_chat_max_tokens": "model.optimizer_qwen_chat_max_tokens",
     "optimizer_qwen_chat_enable_thinking": "model.optimizer_qwen_chat_enable_thinking",
+    "optimizer_qwen_chat_thinking_mode": "model.optimizer_qwen_chat_thinking_mode",
     "target_qwen_chat_base_url": "model.target_qwen_chat_base_url",
     "target_qwen_chat_api_key": "model.target_qwen_chat_api_key",
     "target_qwen_chat_temperature": "model.target_qwen_chat_temperature",
     "target_qwen_chat_timeout_seconds": "model.target_qwen_chat_timeout_seconds",
     "target_qwen_chat_max_tokens": "model.target_qwen_chat_max_tokens",
     "target_qwen_chat_enable_thinking": "model.target_qwen_chat_enable_thinking",
+    "target_qwen_chat_thinking_mode": "model.target_qwen_chat_thinking_mode",
+    "minimax_region": "model.minimax_region",
     "minimax_base_url": "model.minimax_base_url",
     "minimax_api_key": "model.minimax_api_key",
     "minimax_model": "model.minimax_model",
     "minimax_temperature": "model.minimax_temperature",
     "minimax_max_tokens": "model.minimax_max_tokens",
     "minimax_enable_thinking": "model.minimax_enable_thinking",
+    "openai_compatible_base_url": "model.openai_compatible_base_url",
+    "openai_compatible_api_key": "model.openai_compatible_api_key",
+    "openai_compatible_model": "model.openai_compatible_model",
+    "openai_compatible_temperature": "model.openai_compatible_temperature",
+    "openai_compatible_timeout_seconds": "model.openai_compatible_timeout_seconds",
+    "openai_compatible_max_tokens": "model.openai_compatible_max_tokens",
+    "optimizer_openai_compatible_base_url": "model.optimizer_openai_compatible_base_url",
+    "optimizer_openai_compatible_api_key": "model.optimizer_openai_compatible_api_key",
+    "optimizer_openai_compatible_model": "model.optimizer_openai_compatible_model",
+    "optimizer_openai_compatible_temperature": "model.optimizer_openai_compatible_temperature",
+    "optimizer_openai_compatible_timeout_seconds": "model.optimizer_openai_compatible_timeout_seconds",
+    "optimizer_openai_compatible_max_tokens": "model.optimizer_openai_compatible_max_tokens",
+    "target_openai_compatible_base_url": "model.target_openai_compatible_base_url",
+    "target_openai_compatible_api_key": "model.target_openai_compatible_api_key",
+    "target_openai_compatible_model": "model.target_openai_compatible_model",
+    "target_openai_compatible_temperature": "model.target_openai_compatible_temperature",
+    "target_openai_compatible_timeout_seconds": "model.target_openai_compatible_timeout_seconds",
+    "target_openai_compatible_max_tokens": "model.target_openai_compatible_max_tokens",
     "codex_exec_path": "model.codex_exec_path",
     "codex_exec_sandbox": "model.codex_exec_sandbox",
     "codex_exec_profile": "model.codex_exec_profile",
@@ -347,6 +478,12 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
     "claude_code_exec_max_thinking_tokens": "model.claude_code_exec_max_thinking_tokens",
     "cursor_exec_path": "model.cursor_exec_path",
     "cursor_exec_sandbox": "model.cursor_exec_sandbox",
+    "copilot_exec_path": "model.copilot_exec_path",
+    "copilot_exec_home": "model.copilot_exec_home",
+    "copilot_exec_allow_all_tools": "model.copilot_exec_allow_all_tools",
+    "copilot_chat_optimizer_model": "model.copilot_chat_optimizer_model",
+    "copilot_chat_target_model": "model.copilot_chat_target_model",
+    "copilot_chat_timeout": "model.copilot_chat_timeout",
     "codex_trace_to_optimizer": "model.codex_trace_to_optimizer",
     "num_epochs": "train.num_epochs",
     "train_size": "train.train_size",
@@ -357,7 +494,6 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
     "minibatch_size": "gradient.minibatch_size",
     "merge_batch_size": "gradient.merge_batch_size",
     "analyst_workers": "gradient.analyst_workers",
-    "max_analyst_rounds": "gradient.max_analyst_rounds",
     "failure_only": "gradient.failure_only",
     "edit_budget": "optimizer.learning_rate",
     "min_edit_budget": "optimizer.min_learning_rate",
@@ -383,14 +519,117 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
 
 def load_config(args: argparse.Namespace) -> dict:
     """Load config with _base_ inheritance, then apply CLI overrides."""
-    from skillopt.config import load_config as _load, flatten_config, is_structured
+    import warnings
 
-    cfg = _load(args.config, overrides=args.cfg_options)
+    from skillopt.config import flatten_config, is_structured
+    from skillopt.config import load_config as _load
+
+    # F08: Warn when API keys are supplied on the CLI. Keep the replacement
+    # guidance specific to each backend and, where applicable, each role.
+    _credential_guidance = {
+        "azure_api_key": (
+            "AZURE_OPENAI_API_KEY or "
+            "--azure_openai_auth_mode=managed_identity"
+        ),
+        "azure_openai_api_key": (
+            "AZURE_OPENAI_API_KEY or "
+            "--azure_openai_auth_mode=managed_identity"
+        ),
+        "optimizer_azure_openai_api_key": (
+            "OPTIMIZER_AZURE_OPENAI_API_KEY or "
+            "--optimizer_azure_openai_auth_mode=managed_identity"
+        ),
+        "target_azure_openai_api_key": (
+            "TARGET_AZURE_OPENAI_API_KEY or "
+            "--target_azure_openai_auth_mode=managed_identity"
+        ),
+        "qwen_chat_api_key": "QWEN_CHAT_API_KEY",
+        "optimizer_qwen_chat_api_key": "OPTIMIZER_QWEN_CHAT_API_KEY",
+        "target_qwen_chat_api_key": "TARGET_QWEN_CHAT_API_KEY",
+        "minimax_api_key": "MINIMAX_API_KEY",
+        "openai_compatible_api_key": "OPENAI_COMPATIBLE_API_KEY",
+        "optimizer_openai_compatible_api_key": "OPTIMIZER_OPENAI_COMPATIBLE_API_KEY",
+        "target_openai_compatible_api_key": "TARGET_OPENAI_COMPATIBLE_API_KEY",
+    }
+    for _cli_key, _guidance in _credential_guidance.items():
+        if getattr(args, _cli_key, None):
+            warnings.warn(
+                f"--{_cli_key} is deprecated: provide credentials via "
+                f"{_guidance} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+    _structured_credential_guidance = dict(_credential_guidance)
+    _structured_credential_guidance.update({
+        # MiniMax is currently configured through one shared runtime client; a
+        # secret supplied through either role-shaped field belongs in the
+        # shared MINIMAX_API_KEY environment variable instead.
+        "optimizer_minimax_api_key": _credential_guidance["minimax_api_key"],
+        "target_minimax_api_key": _credential_guidance["minimax_api_key"],
+    })
+    _credential_suffixes = ("api_key", "api-key", "token", "secret", "password")
+    for _override in getattr(args, "cfg_options", None) or []:
+        _key, _separator, _value = str(_override).partition("=")
+        _key = _key.strip()
+        _leaf = _key.casefold().rsplit(".", 1)[-1]
+        _guidance = _structured_credential_guidance.get(_leaf)
+        if not _guidance and _leaf.endswith(_credential_suffixes):
+            _guidance = "a backend-specific environment variable or managed identity"
+        if _separator and _guidance and _value:
+            warnings.warn(
+                f"--cfg-options {_key}=... exposes a credential in "
+                f"the process command line: provide it via {_guidance} instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+    # Retired dotted overrides can otherwise create a structured section in a
+    # legacy flat config before format detection.  Filter them before loading;
+    # the original list is still used below to produce the migration warning.
+    _retired_override_keys = set(_RETIRED_CLI_OPTIONS)
+    _retired_override_keys.update(
+        dotted for dotted, _rationale in _RETIRED_CLI_OPTIONS.values()
+    )
+    _active_cfg_options = []
+    for _option in getattr(args, "cfg_options", None) or []:
+        _key, _separator, _value = str(_option).partition("=")
+        if _separator and _key.strip() in _retired_override_keys:
+            continue
+        _active_cfg_options.append(_option)
+
+    cfg = _load(args.config, overrides=_active_cfg_options)
     structured = is_structured(cfg)
+
+    for _retired, (_dotted, _rationale) in _RETIRED_CLI_OPTIONS.items():
+        _sources = _retired_option_sources(args, cfg, structured, _retired, _dotted)
+        if _sources:
+            warnings.warn(
+                f"{_dotted} was retired and is ignored: {_rationale}. "
+                f"Still supplied via {', '.join(_sources)}; remove it.",
+                # FutureWarning rather than DeprecationWarning: ``skillopt-train``
+                # is a console script pointing at ``scripts.train:main``, so this
+                # is raised from an imported module and not from ``__main__``.
+                # Python's default filters are ``default::DeprecationWarning:
+                # __main__`` followed by ``ignore::DeprecationWarning``, which
+                # would drop it before any normal CLI user saw it.
+                FutureWarning,
+                stacklevel=2,
+            )
+
+        # A retired key in a legacy flat file would otherwise survive in the
+        # returned trainer config.  Structured files need the nested key
+        # removed before flattening as well.
+        cfg.pop(_retired, None)
+        _section, _key = _dotted.split(".", 1)
+        _section_cfg = cfg.get(_section)
+        if isinstance(_section_cfg, dict):
+            _section_cfg.pop(_key, None)
 
     # Apply legacy --key value overrides
     cli = {k: v for k, v in vars(args).items()
-           if v is not None and k not in ("config", "cfg_options")}
+           if v is not None
+           and k not in ("config", "cfg_options")
+           and k not in _RETIRED_CLI_OPTIONS}
     if cli:
         if structured:
             from skillopt.config import apply_overrides
@@ -423,6 +662,11 @@ def load_config(args: argparse.Namespace) -> dict:
             if key == "model.backend":
                 explicit_backend = str(option).split("=", 1)[1].strip()
                 break
+    if explicit_backend is None:
+        # ``model.backend`` from a structured YAML file is flattened to
+        # ``model_backend``.  Treat it like the equivalent CLI selection so
+        # its role mapping (and backend-specific model defaults) is applied.
+        explicit_backend = flat.get("model_backend") or flat.get("backend")
 
     backend = normalize_backend_name(flat.get("model_backend") or flat.get("target_backend") or "azure_openai")
 
@@ -438,79 +682,128 @@ def load_config(args: argparse.Namespace) -> dict:
     if explicit_backend is not None:
         backend = normalize_backend_name(explicit_backend)
         flat["model_backend"] = backend
-        if backend in {"claude", "claude_chat"}:
-            flat.setdefault("optimizer_backend", "claude_chat")
-            flat.setdefault("target_backend", "claude_chat")
+
+        def _set_role(key: str, value: str) -> None:
+            if (
+                not _has_model_override(f"model.{key}", key)
+                and flat.get(key) in _ROLE_BACKEND_DEFAULTS
+            ):
+                flat[key] = value
+
+        if backend == "claude_chat":
+            _set_role("optimizer_backend", "claude_chat")
+            _set_role("target_backend", "claude_chat")
         elif backend in {"codex", "codex_exec"}:
-            if not _has_model_override("model.optimizer_backend", "optimizer_backend"):
-                flat["optimizer_backend"] = "codex_exec"
-            if not _has_model_override("model.target_backend", "target_backend"):
-                flat["target_backend"] = "codex_exec"
+            _set_role("optimizer_backend", "codex_exec")
+            _set_role("target_backend", "codex_exec")
         elif backend == "claude_code_exec":
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "claude_code_exec")
+            # Only the target defaults to Claude Code (it produces the SDK trace
+            # the reflector consumes); the optimizer keeps its configured
+            # backend so an explicit --optimizer_backend is never clobbered.
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "claude_code_exec")
         elif backend == "cursor_exec":
-            if not _has_model_override("model.optimizer_backend", "optimizer_backend"):
-                flat["optimizer_backend"] = "openai_chat"
-            if not _has_model_override("model.target_backend", "target_backend"):
-                flat["target_backend"] = "cursor_exec"
-        elif backend in {"qwen", "qwen_chat"}:
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "qwen_chat")
-        elif backend in {"minimax", "minimax_chat"}:
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "minimax_chat")
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "cursor_exec")
+        elif backend == "copilot_chat":
+            _set_role("optimizer_backend", "copilot_chat")
+            _set_role("target_backend", "copilot_chat")
+        elif backend == "copilot_exec":
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "copilot_exec")
+        elif backend == "qwen_chat":
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "qwen_chat")
+        elif backend == "minimax_chat":
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "minimax_chat")
+        elif backend == "openai_compatible":
+            _set_role("optimizer_backend", "openai_compatible")
+            _set_role("target_backend", "openai_compatible")
         else:
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "openai_chat")
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "openai_chat")
     else:
         flat.setdefault("optimizer_backend", "openai_chat")
         flat.setdefault("target_backend", "openai_chat")
 
     if flat.get("optimizer_backend") == "claude_chat":
         if (
-            str(flat.get("optimizer_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("optimizer_model") or str(flat.get("optimizer_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.optimizer", "optimizer_model")
         ):
             flat["optimizer_model"] = default_model_for_backend("claude_chat")
+    if flat.get("optimizer_backend") == "claude_code_exec":
+        if (
+            (not flat.get("optimizer_model") or str(flat.get("optimizer_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
+            and not _has_model_override("model.optimizer", "optimizer_model")
+        ):
+            flat["optimizer_model"] = default_model_for_backend("claude_code_exec")
     if flat.get("optimizer_backend") == "qwen_chat":
         if (
-            str(flat.get("optimizer_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("optimizer_model") or str(flat.get("optimizer_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.optimizer", "optimizer_model")
         ):
             flat["optimizer_model"] = default_model_for_backend("qwen_chat")
+    if flat.get("optimizer_backend") == "openai_compatible":
+        if (
+            (not flat.get("optimizer_model") or str(flat.get("optimizer_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
+            and not _has_model_override("model.optimizer", "optimizer_model")
+        ):
+            flat["optimizer_model"] = (
+                flat.get("optimizer_openai_compatible_model")
+                or flat.get("openai_compatible_model")
+                or default_model_for_backend("openai_compatible")
+            )
     if flat.get("target_backend") == "claude_chat":
         if (
-            str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.target", "target_model")
         ):
             flat["target_model"] = default_model_for_backend("claude_chat")
     if flat.get("target_backend") == "claude_code_exec":
         if (
-            str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.target", "target_model")
         ):
             flat["target_model"] = default_model_for_backend("claude_chat")
     if flat.get("target_backend") == "cursor_exec":
         if (
-            str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.target", "target_model")
         ):
             flat["target_model"] = default_model_for_backend("cursor_exec")
+    if flat.get("target_backend") == "copilot_exec":
+        if (
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
+            and not _has_model_override("model.target", "target_model")
+        ):
+            # Copilot CLI model IDs are independent of Azure deployment names.
+            flat["target_model"] = ""
     if flat.get("target_backend") == "qwen_chat":
         if (
-            str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.target", "target_model")
         ):
             flat["target_model"] = default_model_for_backend("qwen_chat")
     if flat.get("target_backend") == "minimax_chat":
         if (
-            str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
             and not _has_model_override("model.target", "target_model")
         ):
             flat["target_model"] = (
                 flat.get("minimax_model")
                 or default_model_for_backend("minimax_chat")
+            )
+    if flat.get("target_backend") == "openai_compatible":
+        if (
+            (not flat.get("target_model") or str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS)
+            and not _has_model_override("model.target", "target_model")
+        ):
+            flat["target_model"] = (
+                flat.get("target_openai_compatible_model")
+                or flat.get("openai_compatible_model")
+                or default_model_for_backend("openai_compatible")
             )
 
     # Auto-generate output root
@@ -531,7 +824,7 @@ def main() -> None:
     cfg = load_config(args)
 
     print(f"\n{'='*60}")
-    print(f"  SkillOpt — Executive Strategy for Self-Evolving Agent Skills")
+    print("  SkillOpt — Executive Strategy for Self-Evolving Agent Skills")
     print(f"{'='*60}")
     print(f"  env:            {cfg.get('env')}")
     print(f"  optimizer_model:  {cfg.get('optimizer_model')}")
@@ -542,7 +835,7 @@ def main() -> None:
     print(f"  rewrite_effort: {cfg.get('rewrite_reasoning_effort') or 'off'}")
     print(f"  epochs:         {cfg.get('num_epochs')}")
     print(f"  train_size:     {cfg.get('train_size') or 'from dataset'}")
-    print(f"  steps/epoch:    auto")
+    print("  steps/epoch:    auto")
     print(f"  batch_size:     {cfg.get('batch_size')}")
     print(f"  edit_budget:    {cfg.get('edit_budget')}")
     print(f"  lr_scheduler:   {cfg.get('lr_scheduler', 'constant')}")

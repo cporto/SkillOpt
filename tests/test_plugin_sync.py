@@ -4,6 +4,8 @@ Run: python3 -m pytest tests/test_plugin_sync.py -v
 """
 import json
 import os
+import subprocess
+import sys
 import unittest
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -12,11 +14,15 @@ PLUGIN_SKILL_MDS = {
     "claude-code": os.path.join(REPO, "plugins/claude-code/skills/skillopt-sleep/SKILL.md"),
     "codex": os.path.join(REPO, "plugins/codex/skills/skillopt-sleep/SKILL.md"),
     "cursor": os.path.join(REPO, "plugins/cursor/skills/skillopt-sleep/SKILL.md"),
+    "dsh": os.path.join(REPO, "plugins/dsh/skills/skillopt-sleep/SKILL.md"),
     "openclaw": os.path.join(REPO, "plugins/openclaw/SKILL.md"),
 }
 
 MCP_SERVER = os.path.join(REPO, "plugins/copilot/mcp_server.py")
+COPILOT_README = os.path.join(REPO, "plugins/copilot/README.md")
 COPILOT_INSTRUCTIONS = os.path.join(REPO, "plugins/copilot/copilot-instructions.snippet.md")
+DEVIN_README = os.path.join(REPO, "plugins/devin/README.md")
+DEVIN_RULES = os.path.join(REPO, "plugins/devin/devin-rules.snippet.md")
 
 CANONICAL_BACKENDS = {"mock", "claude", "codex", "copilot"}
 CURSOR_MANIFEST = os.path.join(REPO, "plugins/cursor/.cursor-plugin/plugin.json")
@@ -107,11 +113,60 @@ class TestPluginParity(unittest.TestCase):
 
     def test_openclaw_wrapper_matches_shared_backend_signature(self):
         text = _read(OPENCLAW_RUNNER)
+        self.assertIn('claude_path="claude"', text)
+        self.assertIn('pi_path=""', text)
         self.assertIn('cursor_path=""', text)
+        self.assertIn('opencode_path=""', text)
+        self.assertIn('azure_endpoint=""', text)
         self.assertIn('project_dir=""', text)
+        self.assertIn("claude_path=claude_path", text)
+        self.assertIn("pi_path=pi_path", text)
         self.assertIn("cursor_path=cursor_path", text)
+        self.assertIn("opencode_path=opencode_path", text)
+        self.assertIn("azure_endpoint=azure_endpoint", text)
         self.assertIn("project_dir=project_dir", text)
         self.assertNotIn("**kwargs", text)
+
+        script = f"""
+import inspect
+import runpy
+import sys
+sys.path.insert(0, {os.path.dirname(OPENCLAW_RUNNER)!r})
+runner = runpy.run_path({OPENCLAW_RUNNER!r}, run_name="openclaw_runner_test")
+wrapped_get_backend = runner["get_backend"]
+assert inspect.signature(wrapped_get_backend).parameters["opencode_tool_replay"].default is False
+
+enabled = wrapped_get_backend(
+    "opencode",
+    opencode_path="unused-opencode",
+    opencode_tool_replay=True,
+)
+assert enabled.tool_replay is True, enabled.tool_replay
+
+stringly_enabled = wrapped_get_backend(
+    "opencode",
+    opencode_path="unused-opencode",
+    opencode_tool_replay="true",
+)
+assert stringly_enabled.tool_replay is False, stringly_enabled.tool_replay
+
+from skillopt_sleep.backend import build_backend
+backend = build_backend(
+    backend="mock",
+    pi_path="unused-pi",
+    opencode_path="unused-opencode",
+    azure_endpoint="https://unused.invalid",
+)
+assert backend.name == "mock", backend.name
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_all_skill_mds_mention_all_backends(self):
         for name, path in PLUGIN_SKILL_MDS.items():
@@ -151,9 +206,23 @@ class TestPluginParity(unittest.TestCase):
     def test_mcp_schema_has_key_params(self):
         text = _read(MCP_SERVER)
         for param in ["source", "tasks_file", "target_skill_path",
+                       "staging", "skills", "all_skills", "legacy",
                        "max_sessions", "max_tasks", "auto_adopt", "json"]:
             self.assertIn(f'"{param}"', text,
                           f"MCP schema missing param '{param}'")
+
+    def test_mcp_adoption_docs_cover_fanout_selection(self):
+        for path in (COPILOT_README, COPILOT_INSTRUCTIONS, DEVIN_README, DEVIN_RULES):
+            text = _read(path)
+            for param in ("staging", "skills", "all_skills", "legacy"):
+                self.assertIn(f"`{param}`", text, f"{path} missing `{param}`")
+
+    def test_devin_docs_disclaim_post_adoption_copy(self):
+        for path in (DEVIN_README, DEVIN_RULES):
+            text = _read(path).lower()
+            self.assertIn("no post-adoption copy", text)
+            self.assertIn("target_skill_path", text)
+            self.assertIn("core engine", text)
 
     def test_all_skill_mds_mention_memory_consolidation(self):
         for name, path in PLUGIN_SKILL_MDS.items():

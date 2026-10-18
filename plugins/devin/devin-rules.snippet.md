@@ -9,9 +9,8 @@ server. Use these tools to improve your long-term skills over time:
   without engine staging/adoption; a real backend still makes provider calls
 - **`sleep_run`** — run a full cycle; stages a proposal by default, while an
   explicit `auto_adopt` may also update live files
-- **`sleep_adopt`** — apply the staged proposal, then sync the managed skill to
-  `.devin/skills/skillopt-sleep-learned/SKILL.md` when `project` is the Devin
-  workspace and that workspace already contains a `.devin/` directory
+- **`sleep_adopt`** — apply a reviewed legacy or per-skill staged proposal;
+  the core engine applies the selected target and creates its backup
 - **`sleep_harvest`** — debug: list the recurring tasks mined from recent sessions
 - **`sleep_schedule`** / **`sleep_unschedule`** — low-level shared-engine cron
   controls; the current scheduled command does not run Devin's conversion step,
@@ -37,5 +36,17 @@ before selecting a real backend.
 
 For a reviewed task file, pass `tasks_file`; before using it with a real backend,
 inspect/redact it and ensure its metadata contains `"reviewed": true`.
+
+Before `sleep_adopt`, inspect `sleep_status` and the staging manifest. Pass
+`staging` for the exact reviewed staging directory, plus exactly one selection
+mode: `skills` (an array of reviewed skill names), `all_skills` (every staged
+per-skill proposal), or `legacy` (the managed `SKILL.md`/`CLAUDE.md` pair). Do
+not combine selection modes. A bare call is only for legacy-only staging
+compatibility; fan-out staging requires explicit selection. Pass names as MCP
+array values, not as an invented shell command.
+
+The adapter performs no post-adoption copy. To operate on a specific Devin
+skill, pass its `SKILL.md` as `target_skill_path`; the core engine is solely
+responsible for applying the reviewed proposal and maintaining its backup.
 
 Place this file at `.devin/rules/skillopt-sleep.md` in your workspace.

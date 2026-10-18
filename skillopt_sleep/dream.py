@@ -22,7 +22,6 @@ from typing import List, Optional
 from skillopt_sleep.consolidate import ConsolidationResult, consolidate
 from skillopt_sleep.types import TaskRecord
 
-
 # ── synthetic augmentation ("dream up" variants of today's tasks) ─────────────
 
 _WRAPPERS = [
@@ -49,6 +48,7 @@ def dream_augment(real_tasks: List[TaskRecord], *, factor: int = 1) -> List[Task
                 judge=dict(t.judge), system=t.system,
                 tags=list(t.tags) + ["dream"], split="train",
                 origin="dream", derived_from=t.id,
+                skill_hint=t.skill_hint,
             ))
     return out
 
@@ -59,19 +59,38 @@ def _tokens(text: str) -> set:
     return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
 
 
-def recall_similar(new_tasks: List[TaskRecord], history: List[TaskRecord],
-                   k: int) -> List[TaskRecord]:
+def _normalize_split(value: str) -> str:
+    return {"replay": "train", "holdout": "val"}.get(value, value)
+
+
+def recall_similar(
+    new_tasks: List[TaskRecord],
+    history: List[TaskRecord],
+    k: int,
+    *,
+    exclude_ids: Optional[set[str]] = None,
+) -> List[TaskRecord]:
     """Return the ``k`` historical tasks most lexically similar to any of
     tonight's ``new_tasks`` (max Jaccard token overlap). Recalled tasks are
     returned as training material (split='train'); deterministic, stdlib-only.
+
+    Archived val/test tasks are never recalled, and ``exclude_ids`` blocks
+    tonight's held-out ids (and their ``derived_from`` sources) from re-entering
+    the training pool.
     """
     if not history or k <= 0 or not new_tasks:
         return []
+    blocked = set(exclude_ids or ())
+    for t in new_tasks:
+        blocked.add(t.id)
+        if t.derived_from:
+            blocked.add(t.derived_from)
     new_tok = [_tokens(t.intent) for t in new_tasks]
-    new_ids = {t.id for t in new_tasks}
     scored = []
     for h in history:
-        if h.id in new_ids:
+        if h.id in blocked:
+            continue
+        if _normalize_split(h.split) in ("val", "test"):
             continue
         ht = _tokens(h.intent)
         if not ht:
@@ -90,6 +109,7 @@ def recall_similar(new_tasks: List[TaskRecord], history: List[TaskRecord],
             reference=h.reference, judge=dict(h.judge), system=h.system,
             tags=list(h.tags) + ["recall"], split="train", origin="real",
             derived_from=h.id,
+            skill_hint=h.skill_hint,
         ))
     return out
 
@@ -109,6 +129,7 @@ def dream_consolidate(
     edit_budget: int = 4,
     gate_metric: str = "mixed",
     gate_mixed_weight: float = 0.5,
+    gate_no_regression: bool = False,
     gate_mode: str = "on",
     evolve_skill: bool = True,
     evolve_memory: bool = True,
@@ -125,14 +146,23 @@ def dream_consolidate(
     train = [t for t in tasks if t.split == "train"]
     enlarged = list(tasks)
     if recall_k > 0 and history_tasks:
-        enlarged += recall_similar(train, history_tasks, recall_k)
+        held_out_ids = {
+            t.id for t in tasks if _normalize_split(t.split) in ("val", "test")
+        }
+        for t in tasks:
+            if t.derived_from:
+                held_out_ids.add(t.derived_from)
+        enlarged += recall_similar(
+            train, history_tasks, recall_k, exclude_ids=held_out_ids,
+        )
     if dream_factor > 0:
         seed = [t for t in enlarged if t.split == "train" and t.origin != "dream"]
         enlarged += dream_augment(seed, factor=dream_factor)
     return consolidate(
         backend, enlarged, skill, memory,
         edit_budget=edit_budget, gate_metric=gate_metric,
-        gate_mixed_weight=gate_mixed_weight, gate_mode=gate_mode,
+        gate_mixed_weight=gate_mixed_weight,
+        gate_no_regression=gate_no_regression, gate_mode=gate_mode,
         rollouts_k=dream_rollouts, evolve_skill=evolve_skill,
         evolve_memory=evolve_memory, night=night,
     )

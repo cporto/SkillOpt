@@ -1,14 +1,13 @@
-import os
-import sys
 import unittest
 from unittest import mock
+
 
 class TestSchedulerWindows(unittest.TestCase):
     @mock.patch("sys.platform", "win32")
     @mock.patch("shutil.which", return_value="C:\\Windows\\System32\\schtasks.exe")
     def test_schedule_windows(self, mock_which):
         from skillopt_sleep.scheduler import schedule
-        
+
         calls = []
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
@@ -17,7 +16,7 @@ class TestSchedulerWindows(unittest.TestCase):
                 stdout = "SUCCESS: The scheduled task ... has successfully been created."
                 stderr = ""
             return Proc()
-            
+
         mock_open = mock.mock_open()
         with mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("os.makedirs") as mock_makedirs, \
@@ -31,9 +30,9 @@ class TestSchedulerWindows(unittest.TestCase):
             self.assertEqual(cmd[1], "/create")
             self.assertEqual(cmd[2], "/tn")
             self.assertTrue(cmd[3].startswith("SkillOpt-Sleep-"))
-            self.assertIn("my_project", cmd[3])
+            self.assertRegex(cmd[3], r"^SkillOpt-Sleep-[0-9a-f]{20}$")
             self.assertEqual(cmd[4], "/tr")
-            self.assertIn("run.cmd", cmd[5])
+            self.assertIn("run.ps1", cmd[5])
             self.assertEqual(cmd[6], "/sc")
             self.assertEqual(cmd[7], "daily")
             self.assertEqual(cmd[8], "/st")
@@ -45,14 +44,14 @@ class TestSchedulerWindows(unittest.TestCase):
             # Verify the content written to the helper script
             handle = mock_open()
             written = "".join(call[0][0] for call in handle.write.call_args_list)
-            self.assertIn("@echo off", written)
-            self.assertIn("run --project", written)
+            self.assertIn("Set-Location -LiteralPath", written)
+            self.assertIn("'run' '--project'", written)
 
     @mock.patch("sys.platform", "win32")
     @mock.patch("shutil.which", return_value="C:\\Windows\\System32\\schtasks.exe")
     def test_unschedule_windows(self, mock_which):
         from skillopt_sleep.scheduler import unschedule
-        
+
         calls = []
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
@@ -61,7 +60,7 @@ class TestSchedulerWindows(unittest.TestCase):
                 stdout = "SUCCESS: The scheduled task ... was successfully deleted."
                 stderr = ""
             return Proc()
-            
+
         with mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("os.path.exists", return_value=True), \
              mock.patch("os.remove") as mock_remove:
