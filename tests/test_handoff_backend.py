@@ -192,6 +192,7 @@ class TestHandoffCli(unittest.TestCase):
                 "run", "--backend", "handoff",
                 "--project", proj,
                 "--claude-home", os.path.join(home, ".claude"),
+                "--source", "claude",
             ])
             # must not crash: corrupt pin -> fresh harvest -> no tasks -> 0
             self.assertEqual(rc, 0)
@@ -298,6 +299,7 @@ class TestHandoffCli(unittest.TestCase):
                 "run", "--backend", "handoff",
                 "--project", proj,
                 "--claude-home", claude_home,
+                "--source", "claude",
             ])
             self.assertEqual(rc, 0)
             # the no-tasks branch must persist last-harvest, otherwise every
